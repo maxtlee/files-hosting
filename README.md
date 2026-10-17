@@ -51,13 +51,20 @@ create an album, anyone can upload **any file type**, anyone can view. There is
 video/audio, PDFs, Office documents, text/code and archives get in-browser
 previews; unknown binaries download.
 
-The UI auto-detects iPhone/iPad and Android (server-side User-Agent plus a
-client-side fallback) and switches to a phone layout: a fixed bottom action bar
-(`Albums`, `Upload`, `Camera`, `New album`), a native **Take Photo / Camera**
-capture button, and device-specific labels (`Choose Photos & Files` on iOS).
-`New album` is always visible in the header, and the albums page has a prominent
-create form (`/albums#new` focuses it). Desktop keeps a normal header with
-`New album` / `All albums` buttons.
+The GUI follows the Google Photos layout: a persistent left navigation rail on
+desktop (`Photos`, `Albums`, `New album`, `Upload`), a top search app bar, a
+date-grouped photo/video feed, album cards, Material-style dialogs, a
+full-screen lightbox with prev/next, and a mobile bottom bar (`Photos`,
+`Albums`, `Upload`, `New`). On phones the rail becomes a slide-out drawer; a
+**New album** dialog is reachable from every page, and uploads can target any
+album from the global **Upload** dialog. Album pages add an **Add photos**
+button, camera capture, and drag-and-drop over the grid. Long-press a tile on
+mobile (or use the hover circle on desktop) to enter Google Photos-style
+selection mode, then **Hide** the selected items; files always stay on disk.
+Search is available on both Photos (`?q=` by filename/album) and Albums
+(`?q=` by title/description) views. The UI auto-detects iPhone/iPad and Android
+(server-side User-Agent plus client fallback) and uses `Choose Photos & Files`
+plus a camera capture input on iOS.
 
 On iPhone/iPad the lightbox exposes **Save to Photos** (and the “save / download”
 link routes images/videos through the same flow). This uses the Web Share API:
@@ -75,8 +82,9 @@ https://files.maxwe.me/albums          (existing Vercel rewrite; no change neede
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/albums` | album grid + "New album" form |
-| `GET` | `/albums/{album_id}` | item grid, drag-drop upload, lightbox/player, delete |
+| `GET` | `/albums` | Google Photos-style feed of photos/videos across all albums |
+| `GET` | `/albums/albums` | album card grid (`/albums/photos` is an alias for the feed) |
+| `GET` | `/albums/{album_id}` | album item grid, add photos, drag-drop, lightbox/player |
 | `GET` | `/albums/asset/{asset_id}` | original (inline for safe media, attachment otherwise; HTTP Range) |
 | `GET` | `/albums/thumb/{asset_id}` | 512 px JPEG thumbnail (images, docs, text, icons) |
 | `GET` | `/albums/preview/{asset_id}` | raster/video/text preview (see below) |

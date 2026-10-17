@@ -288,19 +288,40 @@ def _limit_body(request: Request, cap: int) -> dict:
 # pages
 # --------------------------------------------------------------------------- #
 
-async def albums_page(request: Request) -> Response:
+async def photos_page(request: Request) -> Response:
+    query = (request.query_params.get("q") or "").strip()[:100]
     albums = store.list_albums()
+    media = store.list_recent_media(query=query)
     return _html(
-        ui.render_albums_page(albums, device=_device(request)),
+        ui.render_photos_page(
+            media, albums, device=_device(request), query=query
+        ),
+        head=request.method == "HEAD",
+    )
+
+
+async def albums_page(request: Request) -> Response:
+    query = (request.query_params.get("q") or "").strip()[:100]
+    albums = store.list_albums()
+    if query:
+        ql = query.lower()
+        albums = [
+            a for a in albums
+            if ql in (a.get("title") or "").lower()
+            or ql in (a.get("description") or "").lower()
+        ]
+    return _html(
+        ui.render_albums_page(albums, device=_device(request), query=query),
         head=request.method == "HEAD",
     )
 
 
 async def album_page(request: Request) -> Response:
+    albums = store.list_albums()
     album = _album_or_404(request.path_params.get("album_id", ""))
     if not album:
         return _html(
-            ui.render_not_found(device=_device(request)),
+            ui.render_not_found(device=_device(request), albums=albums),
             status=404,
             head=request.method == "HEAD",
         )
@@ -312,6 +333,7 @@ async def album_page(request: Request) -> Response:
         max_files=cfg.MAX_FILES,
         max_request=cfg.MAX_REQUEST_BYTES,
         device=_device(request),
+        albums=albums,
     )
     return _html(body, head=request.method == "HEAD")
 
@@ -797,8 +819,11 @@ async def stats_api(_request: Request) -> Response:
 
 def routes() -> list[Route]:
     return [
-        Route("/albums", albums_page, methods=["GET", "HEAD"]),
-        Route("/albums/", albums_page, methods=["GET", "HEAD"]),
+        Route("/albums", photos_page, methods=["GET", "HEAD"]),
+        Route("/albums/", photos_page, methods=["GET", "HEAD"]),
+        Route("/albums/albums", albums_page, methods=["GET", "HEAD"]),
+        Route("/albums/albums/", albums_page, methods=["GET", "HEAD"]),
+        Route("/albums/photos", photos_page, methods=["GET", "HEAD"]),
         Route("/albums", create_album, methods=["POST"]),
         Route("/albums/", create_album, methods=["POST"]),
 

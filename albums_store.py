@@ -527,6 +527,25 @@ class Store:
     def get_asset_any(self, asset_id: str) -> Optional[dict]:
         return self._one("SELECT * FROM assets WHERE id=?", (asset_id,))
 
+    def list_recent_media(
+        self, limit: int = 500, offset: int = 0, query: str = ""
+    ) -> list[dict]:
+        """Photos/videos across all visible albums, newest first."""
+        sql = """
+            SELECT x.*, a.title AS album_title
+              FROM assets x JOIN albums a ON a.id=x.album_id
+             WHERE x.deleted=0 AND a.deleted=0
+               AND (x.mime LIKE 'image/%' OR x.mime LIKE 'video/%')
+        """
+        params: list = []
+        if query:
+            sql += " AND (x.original_name LIKE ? OR a.title LIKE ?)"
+            like = f"%{query}%"
+            params += [like, like]
+        sql += " ORDER BY x.created_at DESC LIMIT ? OFFSET ?"
+        params += [max(1, limit), max(0, offset)]
+        return self._all(sql, params)
+
     def list_assets(self, album_id: str) -> list[dict]:
         return self._all(
             """
