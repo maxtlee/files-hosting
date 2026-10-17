@@ -52,6 +52,7 @@ _CSS = r"""
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg); color: var(--fg);
@@ -186,7 +187,7 @@ dialog.lightbox audio { width: min(80vw, 560px); }
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre-wrap; overflow-wrap: anywhere; text-align: left; border-radius: 4px;
 }
-dialog.lightbox .bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; color: #ddd; font-size: .82rem; }
+dialog.lightbox .bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 8px 12px; color: #ddd; font-size: .82rem; }
 dialog.lightbox .bar .spacer { flex: 1; }
 dialog.lightbox .bar a { color: #9ec1ff; }
 dialog.lightbox button { background: rgba(255,255,255,.12); color: #fff; border: 0; }
@@ -434,10 +435,93 @@ _ALBUM_JS = r"""
   var lbDownload = document.getElementById("lb-download");
   var lbName = document.getElementById("lb-name");
   var lbOpen = document.getElementById("lb-open");
+  var lbSave = document.getElementById("lb-save");
   var lbPrev = document.getElementById("lb-prev");
   var lbNext = document.getElementById("lb-next");
   var current = -1;
   var textToken = 0;
+  var currentFull = "";
+  var currentName = "";
+  var currentMime = "";
+  var currentKind = "";
+  var currentShare = "";
+  var currentShareName = "";
+  var currentShareMime = "";
+  var shareCache = {};
+  var isIOS = body.classList.contains("device-ios");
+  var isMobile = body.classList.contains("device-mobile");
+  var shareSupported = !!(navigator.share && navigator.canShare);
+
+  function originalFile(full, name, mime) {
+    if (!shareCache[full]) {
+      shareCache[full] = fetch(full).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.blob();
+      }).then(function (blob) {
+        var type = mime || blob.type || "application/octet-stream";
+        try {
+          return new File([blob], name || "file", { type: type });
+        } catch (e) {
+          blob.name = name || "file";
+          return blob;
+        }
+      }).catch(function (err) {
+        delete shareCache[full];
+        throw err;
+      });
+    }
+    return shareCache[full];
+  }
+  function resetSaveLabel() {
+    if (!lbSave) return;
+    lbSave.textContent = isIOS ? "Save to Photos" : "Save / share";
+    lbSave.disabled = false;
+  }
+  function saveCurrent() {
+    if (!currentShare) return;
+    var url = currentShare, name = currentShareName, mime = currentShareMime;
+    if (lbSave) {
+      lbSave.disabled = true;
+      lbSave.textContent = "Preparing…";
+    }
+    var retry = false;
+    originalFile(url, name, mime).then(function (file) {
+      if (navigator.canShare && navigator.share && navigator.canShare({ files: [file] })) {
+        return navigator.share({ files: [file], title: name });
+      }
+      throw new Error("share-unsupported");
+    }).catch(function (err) {
+      // User cancelled the share sheet: do nothing. If iOS dropped the user
+      // activation while a large file downloaded, keep the now-cached file and
+      // ask for one more tap (the second share runs immediately).
+      if (err && err.name === "AbortError") return;
+      if (err && err.name === "NotAllowedError") { retry = true; return; }
+      window.location.href = currentFull || url;
+    }).finally(function () {
+      if (retry && lbSave) {
+        lbSave.disabled = false;
+        lbSave.textContent = "Tap Save again";
+        setTimeout(resetSaveLabel, 4000);
+      } else {
+        resetSaveLabel();
+      }
+    });
+  }
+  if (lbSave) {
+    lbSave.textContent = isIOS ? "Save to Photos" : "Save / share";
+    lbSave.hidden = !isMobile || !shareSupported;
+    lbSave.addEventListener("click", saveCurrent);
+  }
+  if (lbOpen) {
+    lbOpen.textContent = isMobile ? "save / download" : "download";
+    lbOpen.addEventListener("click", function (e) {
+      if (isMobile && (currentKind === "image" || currentKind === "video") &&
+          navigator.share && navigator.canShare) {
+        e.preventDefault();
+        saveCurrent();
+      }
+    });
+  }
 
   function tiles() { return grid ? Array.prototype.slice.call(grid.querySelectorAll(".tile")) : []; }
   function stopMedia() {
@@ -492,7 +576,41 @@ _ALBUM_JS = r"""
     var previewUrl = tile.getAttribute("data-preview") || full;
     var thumb = tile.getAttribute("data-thumb");
     var name = tile.getAttribute("data-name") || "File";
+    var mime = tile.getAttribute("data-mime") || "";
+    currentFull = full;
+    currentName = name;
+    currentMime = mime;
+    currentKind = kind;
+    currentShare = full;
+    currentShareName = name;
+    currentShareMime = mime;
+    if (kind === "video") {
+      currentShare = previewUrl;
+      currentShareName = name.replace(/\.[^.]+$/, "") + ".mp4";
+      currentShareMime = "video/mp4";
+    } else if (kind === "image") {
+      var iosUrl = tile.getAttribute("data-share-ios") || "";
+      var safeUrl = tile.getAttribute("data-share-safe") || full;
+      currentShare = isIOS && iosUrl ? iosUrl : safeUrl;
+      if (currentShare !== full) {
+        currentShareName = name.replace(/\.[^.]+$/, "") + ".jpg";
+        currentShareMime = "image/jpeg";
+      }
+    }
     stopMedia();
+    if (lbSave) {
+      lbSave.hidden = !isMobile || !shareSupported ||
+                      (kind !== "image" && kind !== "video");
+      lbSave.disabled = false;
+      lbSave.textContent = isIOS ? "Save to Photos" : "Save / share";
+    }
+    var size = parseInt(tile.getAttribute("data-size") || "0", 10);
+    if (isMobile && (kind === "image" || kind === "video") &&
+        (!size || size <= 50 * 1024 * 1024)) {
+      // Warm the cache so the share sheet still runs inside the user gesture.
+      // Very large originals are fetched on demand instead of held in memory.
+      originalFile(currentShare, currentShareName, currentShareMime).catch(function () {});
+    }
     if (kind === "image" && lbImg) {
       lbImg.onerror = function () {
         // Last-resort fallback: the server-generated JPEG thumbnail.
@@ -539,7 +657,10 @@ _ALBUM_JS = r"""
       if (e.key === "ArrowLeft") { e.preventDefault(); show(current - 1); }
       if (e.key === "ArrowRight") { e.preventDefault(); show(current + 1); }
     });
-    lb.addEventListener("close", stopMedia);
+    lb.addEventListener("close", function () {
+      stopMedia();
+      shareCache = {};
+    });
   }
   var lbClose = document.getElementById("lb-close");
   if (lbClose) lbClose.addEventListener("click", function () { lb.close(); });
@@ -686,6 +807,14 @@ def _tile(a: dict) -> str:
     preview = f"{BASE}/preview/{aid}"
     mime = a.get("mime") or "application/octet-stream"
     ext = (a.get("ext") or "file").upper()[:6]
+    direct_image = mime in store_mod.DIRECT_IMAGE_MIME
+    if kind == "video":
+        share_safe = share_ios = preview
+    elif kind == "image":
+        share_safe = full if direct_image else preview
+        share_ios = full if mime == "image/heic" else share_safe
+    else:
+        share_safe = share_ios = full
     play = (
         '<span class="play" aria-hidden="true"></span>'
         if kind in ("video", "audio") else ""
@@ -699,7 +828,10 @@ def _tile(a: dict) -> str:
         f'data-preview-kind="{html.escape(kind)}" '
         f'data-full="{html.escape(full)}" data-preview="{html.escape(preview)}" '
         f'data-name="{html.escape(name)}" data-mime="{html.escape(mime)}" '
-        f'data-ext="{html.escape(ext)}" data-thumb="{html.escape(thumb)}">'
+        f'data-size="{int(a.get("size") or 0)}" '
+        f'data-ext="{html.escape(ext)}" data-thumb="{html.escape(thumb)}" '
+        f'data-share-safe="{html.escape(share_safe)}" '
+        f'data-share-ios="{html.escape(share_ios)}">'
         + inner
         + f'<button class="del" type="button" data-delete-asset="{html.escape(aid)}" '
           f'aria-label="Hide {html.escape(name)}">×</button>'
@@ -777,7 +909,10 @@ def render_album_page(
         + '<a id="lb-download" href="#" download>Download file</a>'
         + "</div>"
         + '<div class="bar"><span id="lb-name"></span><span class="spacer"></span>'
-        + '<a id="lb-open" href="#" target="_blank" rel="noopener">open</a>'
+        + '<button class="btn mobile-only" type="button" id="lb-save" '
+          'title="Opens the share sheet — choose Save Image / Save Video">'
+          'Save to Photos</button>'
+        + '<a id="lb-open" href="#" target="_blank" rel="noopener">download</a>'
         + '<button class="btn" type="button" id="lb-prev" aria-label="Previous">‹</button>'
         + '<button class="btn" type="button" id="lb-next" aria-label="Next">›</button>'
         + "</div></div>"

@@ -59,6 +59,13 @@ capture button, and device-specific labels (`Choose Photos & Files` on iOS).
 create form (`/albums#new` focuses it). Desktop keeps a normal header with
 `New album` / `All albums` buttons.
 
+On iPhone/iPad the lightbox exposes **Save to Photos** (and the “save / download”
+link routes images/videos through the same flow). This uses the Web Share API:
+iOS opens the share sheet where **Save Image** / **Save Video** writes to the
+photo library. A web page cannot silently write to Photos — that share-sheet
+confirmation is the supported iOS path. Long-pressing the image and choosing
+“Save to Photos” also works. Other file types still download to Files/Downloads.
+
 ```
 https://agentmaxxer.tail6ca935.ts.net/files/albums
 https://files.maxwe.me/albums          (existing Vercel rewrite; no change needed)
@@ -201,6 +208,10 @@ Other tunables: `ALBUMS_DATA_DIR`, `ALBUMS_HDD_DIR`, `ALBUMS_HDD_MOUNT`,
 `ALBUMS_PREVIEW_IMAGE_MAX_PX`, `ALBUMS_PREVIEW_VIDEO_HEIGHT`,
 `ALBUMS_PREVIEW_VIDEO_TIMEOUT_SECONDS`, `ALBUMS_PREVIEW_DOC_TIMEOUT_SECONDS`,
 `ALBUMS_PREVIEW_TEXT_BYTES`, `ALBUMS_PREVIEW_SANDBOX`.
+
+On a large video (>50 MB) the share file is fetched on demand; if iOS drops the
+user-activation window during the download, the button changes to **Tap Save
+again** and the second tap opens the share sheet immediately with the cached file.
 
 ### Email notifications
 
