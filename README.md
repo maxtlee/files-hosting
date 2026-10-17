@@ -47,7 +47,9 @@ https://agentmaxxer.tail6ca935.ts.net/files/<filename>
 
 Public shared albums, functionally like Google Photos shared albums: anyone can
 create an album, anyone can upload **any file type**, anyone can view. There is
-**no auth** and **no private album** — the UI says so on every page.
+**no auth** and **no private album** — the UI says so on every page. Images,
+video/audio, PDFs, Office documents, text/code and archives get in-browser
+previews; unknown binaries download.
 
 The UI auto-detects iPhone/iPad and Android (server-side User-Agent plus a
 client-side fallback) and switches to a phone layout: a fixed bottom action bar
@@ -68,8 +70,9 @@ https://files.maxwe.me/albums          (existing Vercel rewrite; no change neede
 | --- | --- | --- |
 | `GET` | `/albums` | album grid + "New album" form |
 | `GET` | `/albums/{album_id}` | item grid, drag-drop upload, lightbox/player, delete |
-| `GET` | `/albums/asset/{asset_id}` | original (inline, HTTP Range via `FileResponse`) |
-| `GET` | `/albums/thumb/{asset_id}` | 512 px JPEG thumbnail (generated lazily) |
+| `GET` | `/albums/asset/{asset_id}` | original (inline for safe media, attachment otherwise; HTTP Range) |
+| `GET` | `/albums/thumb/{asset_id}` | 512 px JPEG thumbnail (images, docs, text, icons) |
+| `GET` | `/albums/preview/{asset_id}` | raster/video/text preview (see below) |
 | `POST` | `/albums` | create album (form; JSON also accepted) |
 | `POST` | `/albums/{album_id}/upload` | multipart upload, no-JS fallback → 303 |
 | `GET` | `/albums/api/albums` | list albums (JSON) |
@@ -87,7 +90,8 @@ https://files.maxwe.me/albums          (existing Vercel rewrite; no change neede
 ```
 /mnt/archive-new/files/albums/<album_id>/<asset_id>.<ext>   canonical (HDD)
 ~/Projects/files/data/cache/<album_id>/<asset_id>.<ext>     SSD cache (LRU)
-~/Projects/files/data/thumbs/<asset_id>.jpg                 SSD thumbnails
+~/Projects/files/data/thumbs/<asset_id>.jpg                 SSD thumbnails (all types)
+~/Projects/files/data/previews/<asset_id>.*                 raster/video/text preview cache
 ~/Projects/files/data/tmp/                                  multipart spool + *.part
 ~/Projects/files/data/albums.sqlite3                        metadata (WAL)
 ~/Projects/files/data/notifications.log                     email fallback log
@@ -115,6 +119,41 @@ https://files.maxwe.me/albums          (existing Vercel rewrite; no change neede
   `albums/` directory from its root listing, so `/albums/asset/<id>` is the only
   way to fetch an album file. This keeps shallow deletion meaningful.
 
+### Previews
+
+Previews are generated lazily and cached on the SSD (2 GiB LRU preview budget;
+thumbnails are a separate 512 MiB budget). The original file is **never**
+modified; previews are disposable derivatives.
+
+* **Images**: JPEG/PNG/WebP/GIF/BMP/ICO/AVIF are served inline directly. HEIC/
+  HEIF (`pillow-heif`), TIFF, JPEG XL (`pillow-jxl-plugin`), PSD and camera RAW
+  (`rawpy`: DNG/CR2/CR3/NEF/ARW/RAF/ORF/RW2/…) get a server-rendered JPEG
+  preview, so Chrome/Safari/Android all show something even when the browser
+  cannot decode the original. SVG is rasterised with CairoSVG and the original
+  is always an attachment (never inline markup). Every image gets a JPEG
+  thumbnail.
+* **Video**: browser-safe H.264/VP8/VP9/AV1 in MP4/M4V/WebM plays directly with
+  Range support. HEVC/H.265, MOV, MKV, AVI, MPEG-4 and other containers are
+  transcoded to a 720p H.264/AAC MP4 preview (cached, Range-capable) on first
+  view. Poster frames are extracted for thumbnails.
+* **Documents**: PDFs and Office/ODF documents (DOC/DOCX/ODT/RTF, XLS/XLSX/
+  ODS, PPT/PPTX/ODP, EPUB) are converted to PDF with headless LibreOffice when
+  needed, then the **first page** is rendered to JPEG for grid + lightbox with a
+  “Download original” link. Text is extracted with `pdftotext` when useful.
+* **Text-like files**: TXT/MD/RST/CSV/TSV/JSON/XML/YAML/TOML/code/HTML/CSS/JS/
+  shell/SQL/… show the first 256 KiB as escaped monospace text. JSON is
+  pretty-printed when valid. HTML/SVG are **not** rendered as markup.
+* **Archives**: ZIP/TAR/TGZ listing (first 200 entries with sizes). GZ/BZ2/XZ
+  show the compressed name/size.
+* **Audio**: MP3/M4A/AAC/WAV/OGG/OPUS/FLAC play inline in the lightbox.
+* **Anything else**: generated extension icon, size/type panel and a download
+  button.
+
+External converters (`ffmpeg`/`ffprobe`, `pdftoppm`/`pdftotext`, LibreOffice)
+run under **bubblewrap** when available: no network namespace, read-only
+`/usr`/`/lib`/`/etc`, only the one source file exposed, a writable temp work
+dir, and CPU/memory/file-size timeouts. Pillow/CairoSVG/rawpy run in-process.
+
 SQLite tables: `albums`, `assets` (paths, size, MIME, sha256, dimensions,
 `on_hdd`, `deleted`, `notified`), `upload_events` (persisted rate-limit bytes),
 `notifications` (delivery attempts), `meta`.
@@ -138,9 +177,11 @@ SSD cache copies already verified on the HDD, and regenerable thumbnails.
 * Per file: **1 GiB** (`ALBUMS_MAX_FILE_BYTES`); per request: **50 files**
   (`ALBUMS_MAX_FILES`) and **2 GiB** body (`ALBUMS_MAX_REQUEST_BYTES`). These
   are sized so short phone videos work; the global/per-IP windows still apply.
-* **All file types are accepted.** Images are decoded by Pillow for safe inline
-  preview/thumbnails; everything else is treated as an opaque download. A text
-  file renamed `.jpg` becomes a generic attachment, not an inline image.
+* **All file types are accepted.** Image/video/audio previews are described
+  above; PDFs/Office/text/archives get previews; everything else is an opaque
+  download. Active content (HTML/SVG/scripts) is never served inline from this
+  origin. A text file renamed `.jpg` becomes a generic attachment, not an inline
+  image.
 * Uploaded filenames are display-only: directory components and control
   characters are stripped, and paths are built only from UUID album/asset ids.
   Album titles/descriptions and filenames are HTML-escaped server-side; the UI
@@ -154,7 +195,11 @@ Other tunables: `ALBUMS_DATA_DIR`, `ALBUMS_HDD_DIR`, `ALBUMS_HDD_MOUNT`,
 `ALBUMS_CACHE_DIR`, `ALBUMS_DB_PATH`, `ALBUMS_THUMB_DIR`, `ALBUMS_TMP_DIR`,
 `ALBUMS_CACHE_BUDGET_BYTES`, `ALBUMS_THUMB_BUDGET_BYTES`,
 `ALBUMS_MIN_FREE_BYTES` (refuse uploads below this much free HDD, 5 GiB),
-`ALBUMS_CREATE_MAX_BODY_BYTES`, `ALBUMS_THUMB_MAX_PX`, `ALBUMS_NOTIFY_ENABLED`.
+`ALBUMS_CREATE_MAX_BODY_BYTES`, `ALBUMS_THUMB_MAX_PX`, `ALBUMS_NOTIFY_ENABLED`,
+`ALBUMS_PREVIEW_DIR`, `ALBUMS_PREVIEW_BUDGET_BYTES`,
+`ALBUMS_PREVIEW_IMAGE_MAX_PX`, `ALBUMS_PREVIEW_VIDEO_HEIGHT`,
+`ALBUMS_PREVIEW_VIDEO_TIMEOUT_SECONDS`, `ALBUMS_PREVIEW_DOC_TIMEOUT_SECONDS`,
+`ALBUMS_PREVIEW_TEXT_BYTES`, `ALBUMS_PREVIEW_SANDBOX`.
 
 ### Email notifications
 
@@ -202,10 +247,11 @@ app.py                       ASGI app (Starlette): static host + album routes
 albums.py                    album routes, lifespan, background workers
 albums_store.py              SQLite schema/CRUD, rate window, copy/evict, thumbs
 albums_storage.py            streaming ingest + image validation
+albums_preview.py            thumbnails, image/document/video/text previews
 albums_notify.py             SMTP/HTTP/local notification delivery
 albums_ui.py                 server-rendered HTML/CSS/JS
 albums_config.py             ALBUMS_* environment configuration
-requirements.txt             starlette + uvicorn + python-multipart + Pillow + pillow-heif
+requirements.txt             starlette + uvicorn + python-multipart + Pillow + HEIC/JXL/RAW/Cairo
 data/                        gitignored DB, cache, thumbs, tmp, notification log
 scripts/run.sh               exec .venv/bin/uvicorn app:asgi_app
 scripts/install-service.sh   write + enable + start /etc/systemd/system/files.service
@@ -217,9 +263,16 @@ deploy/vercel.json           rewrite for files.maxwe.me (owner deploys on Vercel
 ```bash
 cd ~/Projects/files
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt   # starlette, uvicorn, python-multipart, Pillow, pillow-heif
+.venv/bin/pip install -r requirements.txt   # starlette, uvicorn, multipart, Pillow, HEIC/JXL/RAW, Cairo
 scripts/install-service.sh          # needs passwordless sudo
 systemctl is-active files.service
+```
+
+Preview converters (system packages):
+
+```bash
+sudo apt-get install -y ffmpeg poppler-utils bubblewrap \
+  libreoffice-writer libreoffice-calc libreoffice-impress
 ```
 
 The unit runs as `max`, `Restart=on-failure`, `WantedBy=multi-user.target`, and

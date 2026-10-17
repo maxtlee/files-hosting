@@ -21,6 +21,7 @@ from starlette.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
     Response,
 )
@@ -28,6 +29,7 @@ from starlette.routing import Route
 
 import albums_config as cfg
 import albums_notify as notify
+import albums_preview as preview
 import albums_storage as storage
 import albums_store as store_mod
 import albums_ui as ui
@@ -42,7 +44,8 @@ _HTML_HEADERS = {
     "referrer-policy": "no-referrer",
     "x-frame-options": "DENY",
     "content-security-policy": (
-        "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; "
+        "default-src 'none'; img-src 'self' data:; media-src 'self'; "
+        "style-src 'unsafe-inline'; "
         "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
         "base-uri 'none'; frame-ancestors 'none'"
     ),
@@ -103,6 +106,8 @@ async def _maintenance() -> None:
                 _enqueue_copy(asset_id)
             await asyncio.to_thread(store.evict_cache)
             await asyncio.to_thread(store.evict_thumbs)
+            await asyncio.to_thread(preview.evict_previews)
+            await asyncio.to_thread(preview.cleanup_preview_temps)
             now = time.monotonic()
             include_hdd = now - last_hdd_cleanup > 3600
             await asyncio.to_thread(
@@ -127,7 +132,8 @@ async def lifespan(_app):
         tasks.append(asyncio.create_task(_notify_worker(), name="albums-notify"))
     print(
         f"[albums] data={cfg.DATA_DIR} hdd={cfg.HDD_DIR} "
-        f"cache={cfg.CACHE_DIR} cache_budget={cfg.effective_cache_budget()}",
+        f"cache={cfg.CACHE_DIR} cache_budget={cfg.effective_cache_budget()} "
+        f"previews={cfg.PREVIEW_DIR}",
         flush=True,
     )
     try:
@@ -207,21 +213,22 @@ def _safe_file(path_value: Optional[str], base: Path) -> Optional[Path]:
 def _asset_public(asset: dict) -> dict:
     base = cfg.ALBUMS_BASE_PATH
     kind = store_mod.asset_kind(asset)
+    pkind = preview.preview_kind(asset)
     return {
         "id": asset["id"],
         "album_id": asset["album_id"],
         "name": asset["original_name"],
         "mime": asset["mime"],
         "kind": kind,
+        "preview_kind": pkind,
         "size": asset["size"],
         "width": asset.get("width"),
         "height": asset.get("height"),
         "created_at": asset["created_at"],
         "on_hdd": bool(asset.get("on_hdd")),
         "url": f"{base}/asset/{asset['id']}",
-        "thumb_url": (
-            f"{base}/thumb/{asset['id']}" if kind == "image" else None
-        ),
+        "thumb_url": f"{base}/thumb/{asset['id']}",
+        "preview_url": f"{base}/preview/{asset['id']}",
     }
 
 
@@ -588,8 +595,7 @@ async def serve_asset(request: Request) -> Response:
         return _html(ui.render_not_found("The photo file is unavailable."), status=404)
 
     await asyncio.to_thread(store.touch_asset, asset_id)
-    kind = store_mod.asset_kind(row)
-    inline = kind in ("image", "video", "audio")
+    inline = store_mod.asset_is_inline(row)
     headers = {
         "x-content-type-options": "nosniff",
         "cache-control": "public, max-age=86400",
@@ -619,9 +625,6 @@ async def serve_thumb(request: Request) -> Response:
     row = store.get_asset(asset_id)
     if not row:
         return _html(ui.render_not_found(), status=404)
-    if store_mod.asset_kind(row) != "image":
-        return _html(ui.render_not_found("No thumbnail for this file."), status=404)
-
     thumb = cfg.THUMB_DIR / f"{asset_id}.jpg"
     if not thumb.is_file():
         async with _thumb_lock_guard:
@@ -629,21 +632,10 @@ async def serve_thumb(request: Request) -> Response:
         async with lock:
             async with _thumb_semaphore:
                 thumb = await asyncio.to_thread(
-                    store_mod.ensure_thumbnail, row
+                    preview.ensure_thumbnail, row
                 ) or thumb
     if not thumb.is_file():
-        # Never break the grid because a thumbnail could not be generated.
-        path = _asset_file(row)
-        if path is None:
-            return _html(ui.render_not_found(), status=404)
-        return FileResponse(
-            path,
-            media_type=row["mime"],
-            headers={
-                "cache-control": "public, max-age=300",
-                "x-content-type-options": "nosniff",
-            },
-        )
+        return _html(ui.render_not_found("No thumbnail available."), status=404)
 
     await asyncio.to_thread(store.touch_asset, asset_id)
     return FileResponse(
@@ -657,6 +649,121 @@ async def serve_thumb(request: Request) -> Response:
 
 
 # --------------------------------------------------------------------------- #
+# previews (image raster, video transcode, document render, text)
+# --------------------------------------------------------------------------- #
+
+_preview_locks: dict[str, asyncio.Lock] = {}
+_preview_lock_guard = asyncio.Lock()
+_preview_semaphore = asyncio.Semaphore(2)
+_video_semaphore = asyncio.Semaphore(1)
+
+
+async def serve_preview(request: Request) -> Response:
+    asset_id = request.path_params.get("asset_id", "")
+    if not _valid_id(asset_id):
+        return _html(ui.render_not_found(), status=404)
+    row = store.get_asset(asset_id)
+    if not row:
+        return _html(ui.render_not_found(), status=404)
+
+    kind = preview.preview_kind(row)
+    base = cfg.ALBUMS_BASE_PATH
+    asset_url = f"{base}/asset/{asset_id}"
+    common = {"x-content-type-options": "nosniff"}
+
+    if kind in ("image", "video", "audio"):
+        needs_raster = kind == "image" and store_mod.asset_needs_raster_preview(row)
+        if kind == "audio":
+            return RedirectResponse(asset_url, status_code=302)
+        if kind == "video":
+            async with _video_semaphore:
+                out = await asyncio.to_thread(preview.ensure_video_preview, row)
+            if out is None:
+                return RedirectResponse(asset_url, status_code=302)
+            await asyncio.to_thread(store.touch_asset, asset_id)
+            return FileResponse(
+                out,
+                media_type="video/mp4",
+                headers={
+                    **common,
+                    "cache-control": "public, max-age=86400",
+                    "content-disposition": "inline",
+                },
+            )
+        if not needs_raster:
+            return RedirectResponse(asset_url, status_code=302)
+        thumb = cfg.PREVIEW_DIR / f"{asset_id}.jpg"
+        if not thumb.is_file():
+            async with _preview_lock_guard:
+                lock = _preview_locks.setdefault(asset_id, asyncio.Lock())
+            async with lock:
+                async with _preview_semaphore:
+                    thumb = await asyncio.to_thread(
+                        preview.ensure_preview_image, row
+                    ) or thumb
+        if not thumb.is_file():
+            return _html(ui.render_not_found("Preview unavailable."), status=404)
+        await asyncio.to_thread(store.touch_asset, asset_id)
+        return FileResponse(
+            thumb,
+            media_type="image/jpeg",
+            headers={
+                **common,
+                "cache-control": "public, max-age=86400",
+                "content-disposition": "inline",
+            },
+        )
+
+    if kind in ("pdf", "office"):
+        out = cfg.PREVIEW_DIR / f"{asset_id}.jpg"
+        if not out.is_file():
+            async with _preview_lock_guard:
+                lock = _preview_locks.setdefault(asset_id, asyncio.Lock())
+            async with lock:
+                async with _preview_semaphore:
+                    out = await asyncio.to_thread(
+                        preview.ensure_preview_image, row
+                    ) or out
+        if not out.is_file():
+            return _html(ui.render_not_found("Preview unavailable."), status=404)
+        await asyncio.to_thread(store.touch_asset, asset_id)
+        return FileResponse(
+            out,
+            media_type="image/jpeg",
+            headers={
+                **common,
+                "cache-control": "public, max-age=86400",
+                "content-disposition": "inline",
+                "x-preview-kind": kind,
+            },
+        )
+
+    if kind in ("text", "archive"):
+        text, truncated = await asyncio.to_thread(preview.text_preview, row)
+        if not text:
+            return PlainTextResponse(
+                "No preview available. Download the original file.",
+                status_code=200,
+                headers={
+                    **common,
+                    "cache-control": "no-store",
+                    "x-preview-empty": "1",
+                },
+            )
+        return PlainTextResponse(
+            text,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                **common,
+                "cache-control": "public, max-age=300",
+                "x-preview-truncated": "1" if truncated else "0",
+            },
+        )
+
+    return _html(ui.render_not_found("No preview for this file type."), status=404)
+
+
+# --------------------------------------------------------------------------- #
 # ops/status
 # --------------------------------------------------------------------------- #
 
@@ -665,6 +772,8 @@ async def stats_api(_request: Request) -> Response:
     data.update(
         {
             "ok": True,
+            "preview_bytes": preview.preview_bytes(),
+            "preview_budget_bytes": cfg.effective_preview_budget(),
             "rate_window_seconds": cfg.RATE_WINDOW_SECONDS,
             "rate_limit_bytes": cfg.RATE_LIMIT_BYTES,
             "per_ip_rate_bytes": cfg.PER_IP_RATE_BYTES,
@@ -709,6 +818,7 @@ def routes() -> list[Route]:
 
         Route("/albums/asset/{asset_id}", serve_asset, methods=["GET", "HEAD"]),
         Route("/albums/thumb/{asset_id}", serve_thumb, methods=["GET", "HEAD"]),
+        Route("/albums/preview/{asset_id}", serve_preview, methods=["GET", "HEAD"]),
 
         Route("/albums/{album_id}/upload", upload_form, methods=["POST"]),
         Route("/albums/{album_id}/delete", delete_album_form, methods=["POST"]),

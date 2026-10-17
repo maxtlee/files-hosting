@@ -38,6 +38,16 @@ try:  # optional iPhone HEIC/HEIF support
 except Exception:  # pragma: no cover - optional dependency
     pillow_heif = None
 
+try:  # optional JPEG XL support
+    import pillow_jxl  # noqa: F401  (registers the Pillow plugin)
+except Exception:  # pragma: no cover - optional dependency
+    pillow_jxl = None
+
+try:  # optional camera RAW support (DNG/CR2/NEF/ARW/...)
+    import rawpy
+except Exception:  # pragma: no cover - optional dependency
+    rawpy = None
+
 import albums_config as cfg
 
 # Refuse absurdly large decompression bombs while still allowing normal photos.
@@ -56,8 +66,27 @@ SAFE_IMAGE_FORMATS = {
     "AVIF": ("avif", "image/avif"),
     "HEIF": ("heic", "image/heic"),
     "HEIC": ("heic", "image/heic"),
+    "TIFF": ("tiff", "image/tiff"),
+    "JXL": ("jxl", "image/jxl"),
+    "PSD": ("psd", "image/vnd.adobe.photoshop"),
 }
 SAFE_IMAGE_MIME = {v[1] for v in SAFE_IMAGE_FORMATS.values()}
+SAFE_IMAGE_MIME.update({"image/svg+xml", "image/x-raw"})
+RAW_EXT = {
+    "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef", "srw",
+    "x3f", "raw",
+}
+# Browser-renderable without a raster derivative. Everything else gets a
+# server-generated JPEG preview so Chrome/Android and Safari all work.
+NEEDS_RASTER_IMAGE_MIME = {
+    "image/heic",
+    "image/tiff",
+    "image/jxl",
+    "image/vnd.adobe.photoshop",
+    "image/svg+xml",
+    "image/x-raw",
+}
+DIRECT_IMAGE_MIME = SAFE_IMAGE_MIME - NEEDS_RASTER_IMAGE_MIME
 
 # Media that is safe to serve inline by container type. A malicious HTML file
 # named .mp4 is still served as video/mp4 + nosniff, which browsers do not
@@ -195,6 +224,33 @@ def probe_media(path: Path, original_name: str) -> dict:
     video/audio (safe containers) and all remaining files are served as
     ``application/octet-stream`` + ``Content-Disposition: attachment``.
     """
+    ext = _safe_ext(original_name)
+    if ext in RAW_EXT and rawpy is not None:
+        try:
+            with rawpy.imread(str(path)) as raw:
+                width, height = raw.sizes.width, raw.sizes.height
+            return {
+                "kind": "image",
+                "ext": ext,
+                "mime": "image/x-raw",
+                "width": width,
+                "height": height,
+            }
+        except Exception:
+            pass
+    if ext == "svg":
+        try:
+            head = path.open("rb").read(8192).lower()
+        except OSError:
+            head = b""
+        if b"<svg" in head:
+            return {
+                "kind": "image",
+                "ext": "svg",
+                "mime": "image/svg+xml",
+                "width": None,
+                "height": None,
+            }
     try:
         with Image.open(path) as im:
             fmt = (im.format or "").upper()
@@ -253,7 +309,18 @@ def asset_kind(asset: dict) -> str:
 
 
 def asset_is_inline(asset: dict) -> bool:
-    return asset_kind(asset) in ("image", "video", "audio")
+    kind = asset_kind(asset)
+    if kind in ("video", "audio"):
+        return True
+    if kind == "image":
+        return (asset.get("mime") or "").lower() in DIRECT_IMAGE_MIME
+    return False
+
+
+def asset_needs_raster_preview(asset: dict) -> bool:
+    return asset_kind(asset) == "image" and (
+        asset.get("mime") or ""
+    ).lower() in NEEDS_RASTER_IMAGE_MIME
 
 
 class Store:
@@ -328,8 +395,8 @@ class Store:
                      WHERE x.album_id=a.id AND x.deleted=0) AS asset_count,
                    (SELECT x.id FROM assets x
                      WHERE x.album_id=a.id AND x.deleted=0
-                       AND x.mime LIKE 'image/%'
-                     ORDER BY x.created_at DESC LIMIT 1) AS cover_id
+                     ORDER BY (x.mime LIKE 'image/%') DESC,
+                              x.created_at DESC LIMIT 1) AS cover_id
               FROM albums a
              WHERE a.deleted=0
              ORDER BY a.created_at DESC

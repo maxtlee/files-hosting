@@ -69,6 +69,9 @@ TMP_DIR = Path(
 THUMB_DIR = Path(
     os.environ.get("ALBUMS_THUMB_DIR", str(DATA_DIR / "thumbs"))
 ).expanduser()
+PREVIEW_DIR = Path(
+    os.environ.get("ALBUMS_PREVIEW_DIR", str(DATA_DIR / "previews"))
+).expanduser()
 NOTIFY_LOG = Path(
     os.environ.get("ALBUMS_NOTIFY_LOG", str(DATA_DIR / "notifications.log"))
 ).expanduser()
@@ -77,6 +80,16 @@ NOTIFY_LOG = Path(
 # the free space on the cache filesystem so the SSD can never fill up.
 CACHE_BUDGET_BYTES = _int("ALBUMS_CACHE_BUDGET_BYTES", 6 * 1024**3, 64 * 1024**2)
 THUMB_BUDGET_BYTES = _int("ALBUMS_THUMB_BUDGET_BYTES", 512 * 1024**2, 16 * 1024**2)
+PREVIEW_BUDGET_BYTES = _int("ALBUMS_PREVIEW_BUDGET_BYTES", 2 * 1024**3, 64 * 1024**2)
+PREVIEW_IMAGE_MAX_PX = _int("ALBUMS_PREVIEW_IMAGE_MAX_PX", 2048, 256)
+PREVIEW_VIDEO_HEIGHT = _int("ALBUMS_PREVIEW_VIDEO_HEIGHT", 720, 144)
+PREVIEW_VIDEO_TIMEOUT = _int("ALBUMS_PREVIEW_VIDEO_TIMEOUT_SECONDS", 300, 10)
+PREVIEW_DOC_TIMEOUT = _int("ALBUMS_PREVIEW_DOC_TIMEOUT_SECONDS", 120, 5)
+PREVIEW_TEXT_BYTES = _int("ALBUMS_PREVIEW_TEXT_BYTES", 256 * 1024, 1024)
+PREVIEW_VIDEO_MAX_BYTES = _int(
+    "ALBUMS_PREVIEW_VIDEO_MAX_BYTES", 1536 * 1024**2, 16 * 1024**2
+)
+PREVIEW_SANDBOX = _bool("ALBUMS_PREVIEW_SANDBOX", True)
 
 MAX_FILE_BYTES = _int("ALBUMS_MAX_FILE_BYTES", 1024 * 1024**2, 1)
 MAX_FILES = _int("ALBUMS_MAX_FILES", 50, 1)
@@ -122,7 +135,7 @@ EMAIL_API_URL = os.environ.get(
 
 def init_dirs() -> None:
     """Create local dirs. The HDD dir may legitimately fail (unmounted disk)."""
-    for path in (DATA_DIR, TMP_DIR, THUMB_DIR, CACHE_DIR):
+    for path in (DATA_DIR, TMP_DIR, THUMB_DIR, PREVIEW_DIR, CACHE_DIR):
         path.mkdir(parents=True, exist_ok=True)
     try:
         HDD_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,6 +156,16 @@ def hdd_mounted() -> bool:
     except OSError:
         return False
     return True
+
+
+def effective_preview_budget() -> int:
+    try:
+        free = shutil.disk_usage(PREVIEW_DIR).free
+    except OSError:
+        return PREVIEW_BUDGET_BYTES
+    if free <= 0:
+        return 0
+    return max(0, min(PREVIEW_BUDGET_BYTES, int(free * 0.5)))
 
 
 def effective_cache_budget() -> int:

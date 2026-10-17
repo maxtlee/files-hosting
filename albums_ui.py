@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 
 import albums_config as cfg
+import albums_preview as preview_mod
 import albums_store as store_mod
 
 BASE = cfg.ALBUMS_BASE_PATH
@@ -176,6 +177,15 @@ dialog.lightbox audio { width: min(80vw, 560px); }
 .lb-file { padding: 34px 18px; text-align: center; color: #ddd; }
 .lb-file .ext { font-size: 2.1rem; font-weight: 800; letter-spacing: .05em; display: block; }
 .lb-file a { color: #9ec1ff; }
+.lb-doc { padding: 16px; text-align: center; color: #ddd; }
+.lb-doc img { max-width: 92vw; max-height: 76vh; object-fit: contain; background: #fff; border-radius: 4px; }
+.lb-doc .note { margin: 8px 0 0; font-size: .8rem; color: #aaa; }
+.lb-text {
+  display: none; margin: 0; max-width: 92vw; max-height: 76vh; overflow: auto;
+  padding: 16px 18px; background: #0b0d11; color: #e5e7eb;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere; text-align: left; border-radius: 4px;
+}
 dialog.lightbox .bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; color: #ddd; font-size: .82rem; }
 dialog.lightbox .bar .spacer { flex: 1; }
 dialog.lightbox .bar a { color: #9ec1ff; }
@@ -414,6 +424,10 @@ _ALBUM_JS = r"""
   var lbImg = document.getElementById("lb-img");
   var lbVideo = document.getElementById("lb-video");
   var lbAudio = document.getElementById("lb-audio");
+  var lbDoc = document.getElementById("lb-doc");
+  var lbDocImg = document.getElementById("lb-doc-img");
+  var lbDocDownload = document.getElementById("lb-doc-download");
+  var lbText = document.getElementById("lb-text");
   var lbFile = document.getElementById("lb-file");
   var lbFileExt = document.getElementById("lb-file-ext");
   var lbFileName = document.getElementById("lb-file-name");
@@ -423,45 +437,90 @@ _ALBUM_JS = r"""
   var lbPrev = document.getElementById("lb-prev");
   var lbNext = document.getElementById("lb-next");
   var current = -1;
+  var textToken = 0;
 
   function tiles() { return grid ? Array.prototype.slice.call(grid.querySelectorAll(".tile")) : []; }
   function stopMedia() {
+    textToken += 1;
     [lbVideo, lbAudio].forEach(function (el) {
       if (!el) return;
       try { el.pause(); } catch (e) {}
       el.removeAttribute("src");
-      el.load();
+      try { el.load(); } catch (e) {}
       el.style.display = "none";
     });
     if (lbImg) { lbImg.removeAttribute("src"); lbImg.style.display = "none"; }
+    if (lbDocImg) { lbDocImg.removeAttribute("src"); }
+    if (lbDoc) lbDoc.style.display = "none";
+    if (lbText) { lbText.textContent = ""; lbText.style.display = "none"; }
     if (lbFile) lbFile.style.display = "none";
+  }
+  function showFilePanel(name, ext, full) {
+    if (!lbFile) return;
+    lbFile.style.display = "block";
+    if (lbFileExt) lbFileExt.textContent = (ext || "FILE").toUpperCase();
+    if (lbFileName) lbFileName.textContent = name;
+    if (lbDownload) lbDownload.href = full;
+  }
+  function showTextPreview(tile, url, name) {
+    if (!lbText) { showFilePanel(name, tile.getAttribute("data-ext"), tile.getAttribute("data-full")); return; }
+    var token = ++textToken;
+    lbText.textContent = "Loading preview…";
+    lbText.style.display = "block";
+    fetch(url, { headers: { "Accept": "text/plain" } }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (text) {
+      if (token !== textToken) return;
+      if (!text || text.indexOf("No preview available.") === 0) throw new Error("empty");
+      lbText.textContent = text;
+    }).catch(function () {
+      if (token !== textToken) return;
+      lbText.style.display = "none";
+      lbText.textContent = "";
+      showFilePanel(name, tile.getAttribute("data-ext"), tile.getAttribute("data-full"));
+    });
   }
   function show(i) {
     var t = tiles();
     if (!t.length) return;
     current = (i + t.length) % t.length;
     var tile = t[current];
-    var kind = tile.getAttribute("data-kind") || "image";
+    var kind = tile.getAttribute("data-preview-kind") ||
+               tile.getAttribute("data-kind") || "image";
     var full = tile.getAttribute("data-full");
+    var previewUrl = tile.getAttribute("data-preview") || full;
+    var thumb = tile.getAttribute("data-thumb");
     var name = tile.getAttribute("data-name") || "File";
     stopMedia();
     if (kind === "image" && lbImg) {
-      var thumb = tile.getAttribute("data-thumb");
       lbImg.onerror = function () {
-        // HEIC/TIFF-style images may not render in every browser; fall back to
-        // the server-generated JPEG thumbnail rather than a broken image.
+        // Last-resort fallback: the server-generated JPEG thumbnail.
         if (thumb && lbImg.src !== thumb) lbImg.src = thumb;
       };
-      lbImg.src = full; lbImg.alt = name; lbImg.style.display = "block";
+      lbImg.src = previewUrl; lbImg.alt = name; lbImg.style.display = "block";
     } else if (kind === "video" && lbVideo) {
-      lbVideo.src = full; lbVideo.style.display = "block";
+      lbVideo.src = previewUrl;
+      if (thumb) lbVideo.poster = thumb;
+      lbVideo.style.display = "block";
+      try { lbVideo.load(); } catch (e) {}
     } else if (kind === "audio" && lbAudio) {
-      lbAudio.src = full; lbAudio.style.display = "block";
-    } else if (lbFile) {
-      lbFile.style.display = "block";
-      if (lbFileExt) lbFileExt.textContent = (tile.getAttribute("data-ext") || "FILE").toUpperCase();
-      if (lbFileName) lbFileName.textContent = name;
-      if (lbDownload) lbDownload.href = full;
+      lbAudio.src = previewUrl; lbAudio.style.display = "block";
+    } else if ((kind === "pdf" || kind === "office") && lbDoc) {
+      lbDoc.style.display = "block";
+      if (lbDocImg) {
+        lbDocImg.onerror = function () {
+          lbDoc.style.display = "none";
+          showFilePanel(name, tile.getAttribute("data-ext"), full);
+        };
+        lbDocImg.src = previewUrl;
+        lbDocImg.alt = name;
+      }
+      if (lbDocDownload) lbDocDownload.href = full;
+    } else if (kind === "text" || kind === "archive") {
+      showTextPreview(tile, previewUrl, name);
+    } else {
+      showFilePanel(name, tile.getAttribute("data-ext"), full);
     }
     lbName.textContent = (current + 1) + " / " + t.length + " — " + name;
     lbOpen.href = full;
@@ -471,11 +530,6 @@ _ALBUM_JS = r"""
     if (e.target.closest(".del")) return;
     var tile = e.target.closest(".tile");
     if (!tile) return;
-    var kind = tile.getAttribute("data-kind") || "image";
-    if (kind === "file") {
-      window.location.href = tile.getAttribute("data-full");
-      return;
-    }
     show(tiles().indexOf(tile));
   });
   if (lbPrev) lbPrev.addEventListener("click", function () { show(current - 1); });
@@ -626,28 +680,26 @@ def render_albums_page(albums: list[dict], device: dict) -> str:
 def _tile(a: dict) -> str:
     aid = a["id"]
     name = a.get("original_name") or "file"
-    kind = store_mod.asset_kind(a)
+    kind = preview_mod.preview_kind(a)
     full = f"{BASE}/asset/{aid}"
+    thumb = f"{BASE}/thumb/{aid}"
+    preview = f"{BASE}/preview/{aid}"
     mime = a.get("mime") or "application/octet-stream"
     ext = (a.get("ext") or "file").upper()[:6]
-    if kind == "image":
-        thumb = f"{BASE}/thumb/{aid}"
-        inner = (
-            f'<img src="{html.escape(thumb)}" '
-            f'alt="{html.escape(name)}" loading="lazy" decoding="async">'
-        )
-    else:
-        play = '<span class="play" aria-hidden="true"></span>' if kind in ("video", "audio") else ""
-        inner = (
-            '<div class="fileicon">'
-            f'<span class="ext">{html.escape(ext)}</span>'
-            f'<small>{html.escape(kind)}</small></div>{play}'
-        )
+    play = (
+        '<span class="play" aria-hidden="true"></span>'
+        if kind in ("video", "audio") else ""
+    )
+    inner = (
+        f'<img src="{html.escape(thumb)}" alt="{html.escape(name)}" '
+        'loading="lazy" decoding="async">' + play
+    )
     return (
         f'<div class="tile" data-kind="{html.escape(kind)}" '
-        f'data-full="{html.escape(full)}" data-name="{html.escape(name)}" '
-        f'data-mime="{html.escape(mime)}" data-ext="{html.escape(ext)}" '
-        f'data-thumb="{html.escape(BASE + "/thumb/" + aid) if kind == "image" else ""}">'
+        f'data-preview-kind="{html.escape(kind)}" '
+        f'data-full="{html.escape(full)}" data-preview="{html.escape(preview)}" '
+        f'data-name="{html.escape(name)}" data-mime="{html.escape(mime)}" '
+        f'data-ext="{html.escape(ext)}" data-thumb="{html.escape(thumb)}">'
         + inner
         + f'<button class="del" type="button" data-delete-asset="{html.escape(aid)}" '
           f'aria-label="Hide {html.escape(name)}">×</button>'
@@ -713,6 +765,12 @@ def render_album_page(
         + '<img id="lb-img" alt="" style="display:none">'
         + '<video id="lb-video" controls playsinline style="display:none"></video>'
         + '<audio id="lb-audio" controls style="display:none"></audio>'
+        + '<div class="lb-doc" id="lb-doc" style="display:none">'
+        + '<img id="lb-doc-img" alt="">'
+        + '<p class="note">Document preview (first page) · '
+        + '<a id="lb-doc-download" href="#" download>Download original</a></p>'
+        + "</div>"
+        + '<pre class="lb-text" id="lb-text"></pre>'
         + '<div class="lb-file" id="lb-file" style="display:none">'
         + '<span class="ext" id="lb-file-ext">FILE</span>'
         + '<p id="lb-file-name"></p>'
