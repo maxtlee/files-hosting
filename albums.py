@@ -124,6 +124,12 @@ async def _maintenance() -> None:
 async def lifespan(_app):
     cfg.init_dirs()
     store.connect()
+    try:
+        fixed = await asyncio.to_thread(store.reclassify_legacy_images)
+        if fixed:
+            print(f"[albums] reclassified {fixed} legacy image asset(s)", flush=True)
+    except Exception as exc:
+        print(f"[albums] legacy reclassify failed: {exc}", flush=True)
     tasks = [
         asyncio.create_task(_copy_worker(), name="albums-copy"),
         asyncio.create_task(_maintenance(), name="albums-maintenance"),

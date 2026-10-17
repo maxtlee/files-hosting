@@ -58,6 +58,7 @@ Image.MAX_IMAGE_PIXELS = 120_000_000
 # attachment (never inline HTML/SVG from this origin).
 SAFE_IMAGE_FORMATS = {
     "JPEG": ("jpg", "image/jpeg"),
+    "MPO": ("jpg", "image/jpeg"),   # iPhone HDR/MPO is JPEG-compatible
     "PNG": ("png", "image/png"),
     "WEBP": ("webp", "image/webp"),
     "GIF": ("gif", "image/gif"),
@@ -454,6 +455,64 @@ class Store:
                 ),
             )
         return self.get_asset(asset_id) or {}
+
+    def reclassify_legacy_images(self, limit: int = 500) -> int:
+        """Re-probe legacy ``application/octet-stream`` image uploads.
+
+        Before MPO/JXL/RAW support existed, an iPhone MPO/JPEG or other valid
+        image could be stored as an opaque file. This only updates metadata
+        (mime/dimensions); paths and bytes are untouched.
+        """
+        image_exts = (
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "ico", "avif",
+            "heic", "heif", "tiff", "tif", "jxl", "psd", "svg", "dng",
+            "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef", "srw",
+            "x3f", "raw",
+        )
+        placeholders = ",".join("?" * len(image_exts))
+        rows = self._all(
+            f"SELECT id, original_name, ext, cache_path, hdd_path "
+            f"FROM assets WHERE mime='application/octet-stream' "
+            f"AND lower(ext) IN ({placeholders}) LIMIT ?",
+            (*image_exts, limit),
+        )
+        fixed = 0
+        for row in rows:
+            path = None
+            for raw, base in (
+                (row.get("cache_path"), cfg.CACHE_DIR),
+                (row.get("hdd_path"), cfg.HDD_DIR),
+            ):
+                if raw:
+                    candidate = Path(raw)
+                    if _within(candidate, base) and candidate.is_file():
+                        path = candidate
+                        break
+            if path is None:
+                continue
+            try:
+                info = probe_media(path, row["original_name"])
+            except Exception:
+                continue
+            if info.get("kind") != "image":
+                continue
+            with self._lock:
+                self._exec(
+                    "UPDATE assets SET mime=?, width=?, height=? WHERE id=?",
+                    (info["mime"], info.get("width"), info.get("height"), row["id"]),
+                )
+            # Drop any icon-card thumb/preview generated while it was opaque;
+            # they regenerate from the real image on the next request.
+            for stale in (
+                cfg.THUMB_DIR / f"{row['id']}.jpg",
+                cfg.PREVIEW_DIR / f"{row['id']}.jpg",
+            ):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            fixed += 1
+        return fixed
 
     def get_asset(self, asset_id: str) -> Optional[dict]:
         return self._one(

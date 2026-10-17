@@ -125,7 +125,8 @@ Previews are generated lazily and cached on the SSD (2 GiB LRU preview budget;
 thumbnails are a separate 512 MiB budget). The original file is **never**
 modified; previews are disposable derivatives.
 
-* **Images**: JPEG/PNG/WebP/GIF/BMP/ICO/AVIF are served inline directly. HEIC/
+* **Images**: JPEG/MPO (iPhone HDR)/PNG/WebP/GIF/BMP/ICO/AVIF are served inline
+  directly. HEIC/
   HEIF (`pillow-heif`), TIFF, JPEG XL (`pillow-jxl-plugin`), PSD and camera RAW
   (`rawpy`: DNG/CR2/CR3/NEF/ARW/RAF/ORF/RW2/…) get a server-rendered JPEG
   preview, so Chrome/Safari/Android all show something even when the browser
