@@ -1,6 +1,7 @@
-"""files — tiny read-only static file host.
+"""files — tiny static file host + public photo albums.
 
-Serves a single directory tree (default /mnt/archive-new/files) over loopback.
+Serves a single directory tree (default /mnt/archive-new/files) over loopback,
+and a public no-auth album system under /albums (see albums.py).
 Public access is handled by Tailscale Funnel at /files; this app binds
 127.0.0.1 only and never exposes anything on its own.
 
@@ -32,6 +33,9 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
+
+from albums import lifespan as albums_lifespan
+from albums import routes as albums_routes
 
 # --------------------------------------------------------------------------- #
 # configuration
@@ -165,7 +169,14 @@ def _listing(request: Request, target: Path, rel: str) -> Response:
     title = "/" + rel.strip("/") if rel.strip("/") else "/"
     rows = []
     try:
-        entries = [e for e in os.scandir(target) if not e.name.startswith(".")]
+        entries = [
+            e for e in os.scandir(target)
+            if not e.name.startswith(".")
+            # The album tree is served by /albums (with DB-backed visibility);
+            # hide the raw directory from the static index so hidden/deleted
+            # items cannot be discovered by browsing.
+            and not (not rel.strip("/") and e.name == "albums")
+        ]
     except OSError as exc:
         return _resp(request, f"403 cannot read directory: {exc}\n", status=403)
 
@@ -233,6 +244,12 @@ async def handle(request: Request) -> Response:
     # An empty path is the root directory, which is always a directory request.
     dir_requested = rel == "" or rel.endswith("/")
 
+    # The canonical album tree lives under FILES_DIR/albums, but raw files must
+    # only be served by /albums/asset/<id> (which honors shallow deletion).
+    # Without this guard a known path would bypass the database entirely.
+    if rel == "albums" or rel.startswith("albums/"):
+        return _error(request, 404, "Not Found")
+
     if not ROOT.is_dir():
         return _resp(
             request,
@@ -275,10 +292,11 @@ async def handle(request: Request) -> Response:
 
 
 app = Starlette(
-    routes=[
+    routes=albums_routes() + [
         Route("/", handle),
         Route("/{path:path}", handle),
-    ]
+    ],
+    lifespan=albums_lifespan,
 )
 
 
