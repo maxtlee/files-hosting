@@ -187,6 +187,7 @@ body.device-mobile .mobile-bar {
   display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
   gap: 6px; padding: 8px max(10px, env(safe-area-inset-left))
            calc(8px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-right));
+  background: var(--card);
   background: color-mix(in srgb, var(--card) 94%, transparent);
   border-top: 1px solid var(--line); backdrop-filter: blur(12px);
 }
