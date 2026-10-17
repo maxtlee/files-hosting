@@ -152,6 +152,7 @@ a:hover {{ text-decoration: underline; }}
 .dir a {{ font-weight: 600; }}
 .empty {{ opacity: .6; font-style: italic; padding: 1rem .6rem; }}
 .warn {{ padding: 1rem; border: 1px solid rgba(200,120,0,.5); background: rgba(200,120,0,.1); border-radius: 6px; max-width: 60rem; }}
+a.albums {{ display: inline-block; margin: 0 0 1rem; padding: .55rem .85rem; border: 1px solid rgba(127,127,127,.35); border-radius: 7px; font-weight: 600; }}
 code {{ background: rgba(127,127,127,.15); padding: .1rem .3rem; border-radius: 4px; }}
 </style>
 </head>
@@ -223,8 +224,11 @@ def _listing(request: Request, target: Path, rel: str) -> Response:
     else:
         table = '<div class="empty">Empty directory.</div>'
 
+    albums_href = f"{PREFIX}/albums" if PREFIX else "/albums"
     body = (
         f"<h1>{html.escape(title)}</h1>"
+        f'<a class="albums" href="{html.escape(albums_href)}">'
+        "Public albums — create one or upload any file type →</a>"
         f'<p class="sub">Drop files here to publish them at '
         f'<code>{html.escape(public_url(rel.strip("/"), True))}</code>.</p>'
         f"{table}"
