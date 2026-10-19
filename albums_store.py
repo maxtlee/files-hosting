@@ -159,6 +159,20 @@ CREATE TABLE IF NOT EXISTS upload_events (
 CREATE INDEX IF NOT EXISTS idx_events_ts ON upload_events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_ip_ts ON upload_events(ip, ts);
 
+CREATE TABLE IF NOT EXISTS upload_sessions (
+    id            TEXT PRIMARY KEY,
+    album_id      TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    received      INTEGER NOT NULL DEFAULT 0,
+    next_index    INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    completed     INTEGER NOT NULL DEFAULT 0,
+    asset_id      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON upload_sessions(updated_at);
+
 CREATE TABLE IF NOT EXISTS notifications (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at REAL NOT NULL,
@@ -711,6 +725,94 @@ class Store:
             return
         with self._lock:
             self._exec("DELETE FROM upload_events WHERE id=?", (event_id,))
+
+    # ------------------------------------------------------- chunk uploads
+    def create_upload_session(self, album_id: str, name: str, size: int) -> dict:
+        import uuid
+
+        upload_id = uuid.uuid4().hex
+        now = time.time()
+        with self._lock:
+            self._exec(
+                "INSERT INTO upload_sessions "
+                "(id, album_id, original_name, size, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (upload_id, album_id, name, size, now, now),
+            )
+        return self.get_upload_session(upload_id) or {}
+
+    def get_upload_session(self, upload_id: str) -> Optional[dict]:
+        return self._one(
+            "SELECT * FROM upload_sessions WHERE id=?", (upload_id,)
+        )
+
+    def record_chunk(
+        self, upload_id: str, index: int, chunk_size: int
+    ) -> tuple[bool, str, Optional[dict]]:
+        """Record a written chunk. Out-of-order chunks are rejected."""
+        with self._lock:
+            row = self._one(
+                "SELECT * FROM upload_sessions WHERE id=?", (upload_id,)
+            )
+            if not row:
+                return False, "upload session not found", None
+            if row["completed"]:
+                return False, "upload already completed", row
+            if index > row["next_index"]:
+                return False, "chunk out of order", row
+            if index < row["next_index"]:
+                # Idempotent retry of an already-recorded chunk.
+                self._exec(
+                    "UPDATE upload_sessions SET updated_at=? WHERE id=?",
+                    (time.time(), upload_id),
+                )
+                return True, "retry", self.get_upload_session(upload_id)
+            new_received = row["received"] + chunk_size
+            if new_received > row["size"]:
+                return False, "upload exceeds declared size", row
+            self._exec(
+                "UPDATE upload_sessions SET received=?, next_index=?, updated_at=? "
+                "WHERE id=?",
+                (new_received, index + 1, time.time(), upload_id),
+            )
+            return True, "ok", self.get_upload_session(upload_id)
+
+    def advance_session_received(
+        self, upload_id: str, received: int
+    ) -> Optional[dict]:
+        with self._lock:
+            self._exec(
+                "UPDATE upload_sessions SET received=?, updated_at=? WHERE id=?",
+                (received, time.time(), upload_id),
+            )
+            return self.get_upload_session(upload_id)
+
+    def complete_upload_session(self, upload_id: str, asset_id: str) -> None:
+        with self._lock:
+            self._exec(
+                "UPDATE upload_sessions SET completed=1, asset_id=?, updated_at=? "
+                "WHERE id=?",
+                (asset_id, time.time(), upload_id),
+            )
+
+    def delete_upload_session(self, upload_id: str) -> None:
+        with self._lock:
+            self._exec("DELETE FROM upload_sessions WHERE id=?", (upload_id,))
+
+    def cleanup_upload_sessions(self, ttl: float) -> list[str]:
+        cutoff = time.time() - ttl
+        with self._lock:
+            rows = self._all(
+                "SELECT id FROM upload_sessions WHERE updated_at < ?", (cutoff,)
+            )
+            ids = [r["id"] for r in rows]
+            if ids:
+                self._exec(
+                    "DELETE FROM upload_sessions WHERE id IN (%s)"
+                    % ",".join("?" * len(ids)),
+                    ids,
+                )
+            return ids
 
     # -------------------------------------------------------- notifications
     def add_notification(

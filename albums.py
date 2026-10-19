@@ -7,6 +7,7 @@ the static host: loopback only, exposed by Tailscale Funnel at ``/files``.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 import time
@@ -16,7 +17,7 @@ from typing import Any, Optional
 
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import (
     FileResponse,
     HTMLResponse,
@@ -108,6 +109,23 @@ async def _maintenance() -> None:
             await asyncio.to_thread(store.evict_thumbs)
             await asyncio.to_thread(preview.evict_previews)
             await asyncio.to_thread(preview.cleanup_preview_temps)
+            for upload_id in await asyncio.to_thread(
+                store.cleanup_upload_sessions, cfg.CHUNK_TTL_SECONDS
+            ):
+                _chunk_cleanup(upload_id)
+            # Orphan chunk dirs (e.g. a failed init) are removed after the TTL.
+            try:
+                cutoff = time.time() - cfg.CHUNK_TTL_SECONDS
+                for entry in os.scandir(cfg.CHUNK_DIR):
+                    if not entry.is_dir():
+                        continue
+                    try:
+                        if entry.stat().st_mtime < cutoff and not store.get_upload_session(entry.name):
+                            shutil.rmtree(entry.path, ignore_errors=True)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
             now = time.monotonic()
             include_hdd = now - last_hdd_cleanup > 3600
             await asyncio.to_thread(
@@ -472,6 +490,14 @@ async def _handle_upload(request: Request, album_id: str) -> Response:
                 max_fields=50,
                 max_part_size=64 * 1024,
             )
+        except ClientDisconnect:
+            print("[albums] client disconnected during multipart upload", flush=True)
+            return _api_error(
+                "client disconnected during upload; please retry", 400
+            ) if wants_json else _html(
+                ui.render_not_found("Upload connection lost. Please retry."),
+                status=400,
+            )
         except MultiPartException as exc:
             return _api_error(f"invalid multipart upload: {exc}", 400) if wants_json else _html(
                 ui.render_not_found("Invalid upload."), status=400
@@ -570,6 +596,220 @@ async def upload_form(request: Request) -> Response:
 
 
 # --------------------------------------------------------------------------- #
+# resumable chunked uploads (used by the browser UI)
+# --------------------------------------------------------------------------- #
+
+def _chunk_dir(upload_id: str):
+    return cfg.CHUNK_DIR / upload_id
+
+
+def _chunk_cleanup(upload_id: str) -> None:
+    shutil.rmtree(_chunk_dir(upload_id), ignore_errors=True)
+
+
+async def chunk_init_api(request: Request) -> Response:
+    album_id = request.path_params.get("album_id", "")
+    album = _album_or_404(album_id)
+    if not album:
+        return _api_error("album not found", 404)
+    if not cfg.HDD_DIR.is_dir() or not cfg.hdd_mounted():
+        return _api_error("storage unavailable (HDD not mounted)", 503)
+    try:
+        free_hdd = shutil.disk_usage(cfg.HDD_DIR).free
+    except OSError:
+        free_hdd = 0
+    if free_hdd < cfg.MIN_FREE_BYTES:
+        return _api_error("storage full", 507)
+    raw_length = request.headers.get("content-length")
+    if raw_length and int(raw_length) > 64 * 1024:
+        return _api_error("request body too large", 413)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object required")
+        size = int(payload.get("size") or 0)
+    except Exception:
+        return _api_error("invalid upload metadata", 400)
+    if size <= 0:
+        return _api_error("empty file", 400)
+    if size > cfg.MAX_FILE_BYTES:
+        return _api_error(
+            f"file too large (max {storage.human_limit(cfg.MAX_FILE_BYTES)})", 413
+        )
+    name = storage.sanitize_name(payload.get("name"))
+    session = store.create_upload_session(album_id, name, size)
+    return _json(
+        {
+            "ok": True,
+            "upload_id": session["id"],
+            "chunk_bytes": cfg.CHUNK_BYTES,
+            "max_chunk_bytes": cfg.MAX_CHUNK_BYTES,
+            "size": size,
+        },
+        status=201,
+    )
+
+
+async def chunk_put_api(request: Request) -> Response:
+    upload_id = request.path_params.get("upload_id", "")
+    if not _valid_id(upload_id):
+        return _api_error("upload session not found", 404)
+    try:
+        index = int(request.path_params.get("index", "-1"))
+    except ValueError:
+        return _api_error("invalid chunk index", 400)
+    if index < 0:
+        return _api_error("invalid chunk index", 400)
+    session = store.get_upload_session(upload_id)
+    if not session:
+        return _api_error("upload session not found", 404)
+    if session["completed"]:
+        return _api_error("upload already completed", 409)
+    if index > session["next_index"]:
+        return _api_error("chunk out of order", 409)
+
+    raw_length = request.headers.get("content-length")
+    try:
+        content_length = int(raw_length) if raw_length else None
+    except ValueError:
+        content_length = None
+    if content_length is not None and content_length > cfg.MAX_CHUNK_BYTES:
+        return _api_error("chunk too large", 413)
+
+    expected = content_length if content_length is not None else cfg.MAX_CHUNK_BYTES
+    ok, retry_after, event_id, _remaining = store.rate_reserve(
+        _client_ip(request), expected, session["album_id"]
+    )
+    if not ok:
+        return _api_error(
+            "upload rate limit exceeded (global/per-IP 5-minute window)",
+            429,
+            {"retry-after": str(retry_after)},
+        )
+
+    chunk_dir = _chunk_dir(upload_id)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    part = chunk_dir / f"{index}.part"
+    final = chunk_dir / f"{index}.chunk"
+    total = 0
+    error_status = 400
+    error_message = "upload failed"
+    try:
+        with open(part, "wb") as fh:
+            async for data in request.stream():
+                total += len(data)
+                if total > cfg.MAX_CHUNK_BYTES:
+                    error_status, error_message = 413, "chunk too large"
+                    raise _BodyTooLarge()
+                if session["received"] + total > session["size"]:
+                    error_status, error_message = 413, "upload exceeds declared size"
+                    raise _BodyTooLarge()
+                fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if total == 0:
+            error_status, error_message = 400, "empty chunk"
+            raise ValueError("empty chunk")
+        os.replace(part, final)
+        recorded, reason, updated = store.record_chunk(upload_id, index, total)
+        if not recorded:
+            try:
+                final.unlink()
+            except OSError:
+                pass
+            return _api_error(reason, 409 if "order" in reason else 400)
+        return _json(
+            {
+                "ok": True,
+                "upload_id": upload_id,
+                "received": updated["received"] if updated else 0,
+                "next_index": updated["next_index"] if updated else index + 1,
+                "size": session["size"],
+            }
+        )
+    except ClientDisconnect:
+        error_status, error_message = 400, "connection lost"
+        print(f"[albums] client disconnected during chunk {upload_id}/{index}", flush=True)
+        return _api_error("connection lost; retry this chunk", 400)
+    except _BodyTooLarge:
+        return _api_error(error_message, error_status)
+    except OSError as exc:
+        print(f"[albums] chunk write failed {upload_id}/{index}: {exc}", flush=True)
+        return _api_error("storage unavailable", 507)
+    except ValueError as exc:
+        return _api_error(str(exc), error_status)
+    finally:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
+        store.rate_finalize(event_id, total, "done" if final.exists() else "cancelled")
+
+
+async def chunk_complete_api(request: Request) -> Response:
+    upload_id = request.path_params.get("upload_id", "")
+    if not _valid_id(upload_id):
+        return _api_error("upload session not found", 404)
+    session = store.get_upload_session(upload_id)
+    if not session:
+        return _api_error("upload session not found", 404)
+    if session["completed"] and session.get("asset_id"):
+        row = store.get_asset_any(session["asset_id"])
+        if row:
+            return _json({"ok": True, "asset": _asset_public(row)})
+        return _api_error("uploaded asset was removed", 410)
+    if session["received"] != session["size"] or session["next_index"] == 0:
+        return _api_error(
+            f"incomplete upload ({session['received']} of {session['size']} bytes)",
+            400,
+        )
+
+    chunk_dir = _chunk_dir(upload_id)
+    assembled = chunk_dir / "assembled.part"
+    total = 0
+    try:
+        with open(assembled, "wb") as out:
+            for i in range(session["next_index"]):
+                chunk = chunk_dir / f"{i}.chunk"
+                if not chunk.is_file():
+                    return _api_error(f"missing chunk {i}", 400)
+                with open(chunk, "rb") as src:
+                    while True:
+                        data = src.read(1024 * 1024)
+                        if not data:
+                            break
+                        out.write(data)
+                        total += len(data)
+        if total != session["size"]:
+            return _api_error(
+                f"size mismatch (expected {session['size']}, got {total})", 400
+            )
+        with open(assembled, "rb") as fh:
+            row = await asyncio.to_thread(
+                storage.ingest_upload,
+                fh,
+                album_id=session["album_id"],
+                original_name=session["original_name"],
+            )
+    except storage.UploadError as exc:
+        return _api_error(exc.message, exc.status)
+    except Exception as exc:
+        print(f"[albums] chunk complete failed {upload_id}: {exc}", flush=True)
+        return _api_error("upload assembly failed", 500)
+
+    store.complete_upload_session(upload_id, row["id"])
+    _chunk_cleanup(upload_id)
+    if not row.get("on_hdd"):
+        _enqueue_copy(row["id"])
+    if cfg.NOTIFY_ENABLED:
+        album = store.get_album(session["album_id"])
+        if album:
+            _notify_queue.put_nowait((album, [row]))
+    return _json({"ok": True, "asset": _asset_public(row)}, status=201)
+
+
+# --------------------------------------------------------------------------- #
 # delete (shallow only)
 # --------------------------------------------------------------------------- #
 
@@ -624,16 +864,21 @@ async def serve_asset(request: Request) -> Response:
 
     await asyncio.to_thread(store.touch_asset, asset_id)
     inline = store_mod.asset_is_inline(row)
+    served_mime = row["mime"] if inline else "application/octet-stream"
+    # Images are safe to edge-cache; video/audio/PDF/opaque downloads are
+    # Range-capable and must not be cached by a CDN that ignores Range (Vercel
+    # would pin a 206 partial to the URL and break later downloads/seeks).
+    cache = "public, max-age=86400" if served_mime.startswith("image/") else "no-store"
     headers = {
         "x-content-type-options": "nosniff",
-        "cache-control": "public, max-age=86400",
+        "cache-control": cache,
         "content-security-policy": "default-src 'none'",
     }
     return FileResponse(
         path,
         # Generic files are forced to a download; HTML/SVG/anything active is
         # never served inline from this public origin.
-        media_type=row["mime"] if inline else "application/octet-stream",
+        media_type=served_mime,
         filename=row["original_name"],
         content_disposition_type="inline" if inline else "attachment",
         headers=headers,
@@ -714,7 +959,8 @@ async def serve_preview(request: Request) -> Response:
                 media_type="video/mp4",
                 headers={
                     **common,
-                    "cache-control": "public, max-age=86400",
+                    # Range-capable video: don't let Vercel cache a 206 partial.
+                    "cache-control": "no-store",
                     "content-disposition": "inline",
                 },
             )
@@ -844,6 +1090,21 @@ def routes() -> list[Route]:
             "/albums/api/assets/{asset_id}/delete",
             delete_asset_api,
             methods=["POST", "DELETE"],
+        ),
+        Route(
+            "/albums/api/albums/{album_id}/chunk/init",
+            chunk_init_api,
+            methods=["POST"],
+        ),
+        Route(
+            "/albums/api/chunks/{upload_id}/complete",
+            chunk_complete_api,
+            methods=["POST"],
+        ),
+        Route(
+            "/albums/api/chunks/{upload_id}/{index}",
+            chunk_put_api,
+            methods=["POST", "PUT"],
         ),
         Route("/albums/api/stats", stats_api, methods=["GET"]),
 

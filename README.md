@@ -43,6 +43,123 @@ https://agentmaxxer.tail6ca935.ts.net/files/<filename>
 * Gracefully degrades when the archive HDD is unmounted (the `fstab` entry is
   `nofail`): the index explains the host is unavailable rather than crashing.
 
+## Curl-friendly listings and folder downloads
+
+The HTML index stays the default. Add `?format=json` (or use
+`/<path>/.index.json`) for a machine-readable directory listing:
+
+```bash
+curl 'https://files.maxwe.me/<path>?format=json'
+curl 'https://files.maxwe.me/<path>/.index.json'
+```
+
+Response:
+
+```json
+{
+  "path": "x/y",
+  "entries": [
+    {"name": "a.txt", "type": "file", "size": 123, "mtime": 1760000000,
+     "url": "/files/x/y/a.txt"},
+    {"name": "sub", "type": "dir", "size": 0, "mtime": 1760000000,
+     "url": "/files/x/y/sub/"}
+  ]
+}
+```
+
+Dotfiles are omitted. `?hidden=1` lists them, but direct requests for dotfiles
+remain refused (as before).
+
+Download a whole folder as an archive (streamed; the root itself cannot be
+archived):
+
+```bash
+curl -L -o x.tar.gz 'https://files.maxwe.me/<path>?archive=tar.gz'
+curl -L -o x.zip    'https://files.maxwe.me/<path>?archive=zip'
+tar tzf x.tar.gz
+```
+
+Both are `Content-Disposition: attachment`. Hidden entries and symlinks are
+skipped; tar.gz is produced by a `tar` subprocess streaming to the client, and
+zip uses a bounded temporary file on the SSD. Limits:
+`FILES_ARCHIVE_MAX_ENTRIES` (100000), `FILES_ARCHIVE_MAX_BYTES` (20 GiB) and
+`FILES_ARCHIVE_MAX_CONCURRENT` (2) — concurrent archive builds beyond the limit
+get `429`.
+
+For a recursive copy of the plain files (not an archive), `wget` works because
+HTML listings are ordinary links:
+
+```bash
+wget -r -np -nH --cut-dirs=1 'https://files.maxwe.me/<path>/'
+```
+
+Use `curl` archives for large trees — `wget -r` makes one request per file and
+dotfiles are never linked.
+
+## Publish a whole folder
+
+`POST /publish` extracts a `.zip`, `.tar`, `.tar.gz`/`.tgz` (or
+`.tar.bz2`/`.tar.xz`) into `FILES_DIR/<folder>/`. It is **token-protected**:
+set `FILES_PUBLISH_TOKEN` in `~/Projects/files/.env` (gitignored; `scripts/run.sh`
+sources it) and restart `files.service`. The token is accepted as
+`Authorization: Bearer <token>` or `?token=<token>`.
+
+```bash
+# one-time setup on the server
+printf 'FILES_PUBLISH_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/Projects/files/.env
+sudo systemctl restart files.service
+
+# publish an archive
+curl -H "Authorization: Bearer $TOKEN" \
+  -F folder=myfolder \
+  -F archive=@myfolder.tar.gz \
+  https://files.maxwe.me/publish
+# -> {"ok":true,"url":"/files/myfolder/","folder":"myfolder","files":12,"bytes":34567}
+```
+
+CLI helper (packs the folder with `.git`, `node_modules`, `__pycache__`,
+`.venv`, `*.pyc` excluded and prints the public URL):
+
+```bash
+export FILES_PUBLISH_TOKEN=...       # or keep it in ~/Projects/files/.env
+scripts/publish.sh ./myfolder        # remote name defaults to "myfolder"
+scripts/publish.sh ./site dist       # publish as /files/dist/
+
+# local test without the Funnel
+FILES_PUBLISH_URL=http://127.0.0.1:8760/publish scripts/publish.sh ./myfolder
+```
+
+Safety: archive members are checked for absolute paths, `..`, backslashes,
+symlinks/hardlinks/devices and duplicate paths; hidden entries are skipped;
+entry count and expanded size are capped; extraction happens in an SSD staging directory,
+is verified, copied to a hidden directory on the HDD, and atomically renamed
+into place. Existing folders are **not** replaced unless the form field
+`overwrite=1` is sent. Failures leave nothing under the served root and clean up
+all staging. Requests are capped by `FILES_PUBLISH_MAX_REQUEST_BYTES` (2 GiB)
+and share the album upload rate window (10 GiB / 5 min global, 2 GiB / 5 min
+per IP); missing/wrong tokens return `401`/`403`.
+
+Small trees can skip the archive with repeated `files` fields plus repeated
+relative `paths` fields (or one JSON array in `paths`):
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  -F folder=myfolder \
+  -F files=@a.txt -F paths=a.txt \
+  -F files=@b.png -F paths=img/b.png \
+  https://files.maxwe.me/publish
+```
+
+A small **Publish folder** page is linked from every directory index at
+`https://files.maxwe.me/publish` (it asks for the token and sends it as an
+`Authorization: Bearer` header from the browser).
+
+Publishing environment keys: `FILES_PUBLISH_TOKEN`, `FILES_PUBLISH_TMP_DIR`,
+`FILES_PUBLISH_MAX_REQUEST_BYTES`, `FILES_PUBLISH_MAX_ENTRIES`,
+`FILES_PUBLISH_MAX_FILES`, `FILES_PUBLISH_MAX_TOTAL_BYTES`,
+`FILES_PUBLISH_MIN_FREE_BYTES`. Non-secret defaults are written by
+`scripts/install-service.sh`; the token belongs only in `.env`.
+
 ## Public albums (`/albums`)
 
 Public shared albums, functionally like Google Photos shared albums: anyone can
@@ -93,7 +210,10 @@ https://files.maxwe.me/albums          (existing Vercel rewrite; no change neede
 | `GET` | `/albums/api/albums` | list albums (JSON) |
 | `POST` | `/albums/api/albums` | create album (JSON) |
 | `GET` | `/albums/api/albums/{album_id}` | album + visible assets (JSON) |
-| `POST` | `/albums/api/albums/{album_id}/upload` | multipart upload, field `files` (JSON) |
+| `POST` | `/albums/api/albums/{album_id}/upload` | multipart upload, field `files` (JSON; curl/no-JS) |
+| `POST` | `/albums/api/albums/{album_id}/chunk/init` | start a resumable chunked upload |
+| `POST` | `/albums/api/chunks/{upload_id}/{index}` | upload one raw 4 MB chunk (retry-safe) |
+| `POST` | `/albums/api/chunks/{upload_id}/complete` | assemble chunks and ingest the file |
 | `POST` | `/albums/api/albums/{album_id}/delete` | shallow-delete album |
 | `POST` | `/albums/api/assets/{asset_id}/delete` | shallow-delete asset |
 | `GET` | `/albums/api/stats` | counts, cache usage, configured limits |
@@ -115,6 +235,11 @@ https://files.maxwe.me/albums          (existing Vercel rewrite; no change neede
 * Uploads are streamed into the SSD cache, inserted into SQLite, and answered
   immediately. A background worker copies each file to the HDD, verifies its
   SHA-256, then sets `on_hdd=1`.
+* The browser UI uses **resumable 4 MB chunks** (`data/chunks`, 24 h TTL) rather
+  than one huge multipart request. Each chunk is retried up to four times on a
+  network/5xx failure; the completed file is assembled and then follows the
+  normal ingest/copy path. This avoids iPhone/proxy disconnections on large
+  photos and videos. Incomplete sessions are cleaned up automatically.
 * **Any file type is accepted.** Pillow-verified images (JPEG/PNG/WebP/GIF/BMP/
   ICO/AVIF and HEIC/HEIF via `pillow-heif`) are served inline with a JPEG
   thumbnail. Common video/audio containers (`.mp4`, `.mov`, `.webm`, `.mp3`,
@@ -215,7 +340,8 @@ Other tunables: `ALBUMS_DATA_DIR`, `ALBUMS_HDD_DIR`, `ALBUMS_HDD_MOUNT`,
 `ALBUMS_PREVIEW_DIR`, `ALBUMS_PREVIEW_BUDGET_BYTES`,
 `ALBUMS_PREVIEW_IMAGE_MAX_PX`, `ALBUMS_PREVIEW_VIDEO_HEIGHT`,
 `ALBUMS_PREVIEW_VIDEO_TIMEOUT_SECONDS`, `ALBUMS_PREVIEW_DOC_TIMEOUT_SECONDS`,
-`ALBUMS_PREVIEW_TEXT_BYTES`, `ALBUMS_PREVIEW_SANDBOX`.
+`ALBUMS_PREVIEW_TEXT_BYTES`, `ALBUMS_PREVIEW_SANDBOX`, `ALBUMS_CHUNK_DIR`,
+`ALBUMS_CHUNK_BYTES`, `ALBUMS_MAX_CHUNK_BYTES`, `ALBUMS_CHUNK_TTL_SECONDS`.
 
 On a large video (>50 MB) the share file is fetched on demand; if iOS drops the
 user-activation window during the download, the button changes to **Tap Save
@@ -263,7 +389,8 @@ logged locally and leave `notified=0`; successful sends set `notified=1`.
 ## Layout
 
 ```
-app.py                       ASGI app (Starlette): static host + album routes
+app.py                       ASGI app: static host, JSON/archive listings, album routes
+publish.py                   token-protected folder publishing (safe extraction)
 albums.py                    album routes, lifespan, background workers
 albums_store.py              SQLite schema/CRUD, rate window, copy/evict, thumbs
 albums_storage.py            streaming ingest + image validation
@@ -274,6 +401,7 @@ albums_config.py             ALBUMS_* environment configuration
 requirements.txt             starlette + uvicorn + python-multipart + Pillow + HEIC/JXL/RAW/Cairo
 data/                        gitignored DB, cache, thumbs, tmp, notification log
 scripts/run.sh               exec .venv/bin/uvicorn app:asgi_app
+scripts/publish.sh           tar.gz + curl helper for POST /publish
 scripts/install-service.sh   write + enable + start /etc/systemd/system/files.service
 deploy/vercel.json           rewrite for files.maxwe.me (owner deploys on Vercel)
 ```
@@ -350,12 +478,20 @@ domain, deploy the `deploy/vercel.json` above. This mirrors `music.maxwe.me` and
 > `https://files.maxwe.me/albums/api/...` work through this rewrite. **No Vercel
 > change is needed for the album feature.**
 
-### Range caveat (important for large media)
+### Range caveat and CDN caching (important for large media)
 
-The **Funnel URL itself supports HTTP Range** — `curl -r 0-99` returns `206`.
-Vercel's rewrite proxy **may not forward the `Range` header**, in which case
-large media served through `files.maxwe.me` might not seek/stream properly and
-could be read in full. For large audio/video, prefer the direct Funnel URL:
+The **Funnel URL supports HTTP Range** (`curl -r 0-99` → `206`). Vercel's rewrite
+proxy also forwards `Range`, **but its edge cache keys on the URL only and ignores
+`Range`** — a cached `206` partial then gets served for a later full GET or a
+different range, producing truncated downloads and unplayable video. Therefore
+the origin sends **`Cache-Control: no-store`** on file bodies (and on the
+Range-capable album media: originals, video previews) so Vercel never caches
+them. Images/thumbnails may still be cached.
+
+If this is changed back to `public, max-age=…`, a cached partial can be pinned to
+the URL for the TTL (300 s). After an origin fix, pre-existing cached entries
+survive at most `max-age`; purge the Vercel cache or wait ~5 minutes. For very
+large media the direct Funnel URL is still the most efficient:
 
 ```
 https://agentmaxxer.tail6ca935.ts.net/files/<filename>

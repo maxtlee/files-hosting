@@ -21,19 +21,33 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import html
+import json
 import mimetypes
 import os
+import tempfile
 import urllib.parse
+import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.requests import Request
-from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.routing import Route
 
+import albums_config as cfg
+import publish as publish_mod
 from albums import lifespan as albums_lifespan
 from albums import routes as albums_routes
 
@@ -48,6 +62,27 @@ try:
     FILE_MAX_AGE = int(os.environ.get("FILES_CACHE_SECONDS", "300"))
 except ValueError:
     FILE_MAX_AGE = 300
+
+# Folder archive downloads (never buffered): caps are checked from metadata
+# before the stream/temp file starts, so oversized folders fail fast.
+try:
+    ARCHIVE_MAX_ENTRIES = int(os.environ.get("FILES_ARCHIVE_MAX_ENTRIES", "100000"))
+except ValueError:
+    ARCHIVE_MAX_ENTRIES = 100000
+try:
+    ARCHIVE_MAX_BYTES = int(
+        os.environ.get("FILES_ARCHIVE_MAX_BYTES", str(20 * 1024**3))
+    )
+except ValueError:
+    ARCHIVE_MAX_BYTES = 20 * 1024**3
+try:
+    ARCHIVE_MAX_CONCURRENT = max(
+        1, int(os.environ.get("FILES_ARCHIVE_MAX_CONCURRENT", "2"))
+    )
+except ValueError:
+    ARCHIVE_MAX_CONCURRENT = 2
+
+_archive_sem = asyncio.Semaphore(ARCHIVE_MAX_CONCURRENT)
 
 # Try to make the served dir if missing (it lives on a `nofail` HDD, so this can
 # legitimately fail when the disk is unmounted — we degrade gracefully below).
@@ -124,6 +159,327 @@ def _resp(request: Request, body: str, status: int = 200,
 
 def _error(request: Request, status: int, message: str) -> Response:
     return _resp(request, f"{status} {message}\n", status=status)
+
+
+def _truthy(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# --------------------------------------------------------------------------- #
+# machine-readable listings (curl / scripts)
+# --------------------------------------------------------------------------- #
+
+def _listing_json(
+    request: Request, target: Path, rel: str, include_hidden: bool
+) -> Response:
+    """JSON directory listing: ``{path, entries:[{name,type,size,mtime,url}]}``."""
+    rel = rel.strip("/")
+    if target.is_file():
+        try:
+            st = target.stat()
+        except OSError as exc:
+            return _error(request, 403, f"cannot stat: {exc}")
+        entries = [{
+            "name": target.name,
+            "type": "file",
+            "size": st.st_size,
+            "mtime": int(st.st_mtime),
+            "url": public_url(rel),
+        }]
+        data = {"path": rel, "entries": entries}
+        return _resp(
+            request,
+            json.dumps(data, ensure_ascii=False) + "\n",
+            content_type="application/json; charset=utf-8",
+        )
+    if not target.is_dir():
+        return _error(request, 404, "Not Found")
+
+    try:
+        raw = list(os.scandir(target))
+    except OSError as exc:
+        return _error(request, 403, f"cannot read directory: {exc}")
+
+    entries = []
+    for e in raw:
+        if e.name.startswith(".publish-"):
+            continue
+        if not include_hidden and e.name.startswith("."):
+            continue
+        # Match the HTML index: the album tree is only reachable via /albums.
+        if not rel and e.name == "albums":
+            continue
+        try:
+            is_dir = e.is_dir()
+            st = e.stat()
+        except OSError:
+            continue
+        child_rel = f"{rel}/{e.name}" if rel else e.name
+        entries.append({
+            "name": e.name,
+            "type": "dir" if is_dir else "file",
+            "size": 0 if is_dir else st.st_size,
+            "mtime": int(st.st_mtime),
+            "url": public_url(child_rel, is_dir),
+        })
+    entries.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+    data = {"path": rel, "entries": entries}
+    return _resp(
+        request,
+        json.dumps(data, ensure_ascii=False) + "\n",
+        content_type="application/json; charset=utf-8",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# folder archives (tar.gz via `tar` subprocess; zip via a bounded temp file)
+# --------------------------------------------------------------------------- #
+
+def _collect_archive(
+    target: Path, include_hidden: bool
+) -> tuple[list[tuple[str, Path, bool, int]], int]:
+    """List regular files/dirs for an archive, refusing symlinks.
+
+    Returns ``(entries, total_bytes)`` where each entry is
+    ``(arcname, path, is_dir, size)``. Hidden files/dirs are skipped unless
+    ``include_hidden``; symlinks are always skipped (never followed).
+    """
+    base = target.name
+    entries: list[tuple[str, Path, bool, int]] = [(base, target, True, 0)]
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
+        current = Path(dirpath)
+        try:
+            parent_rel = current.relative_to(target).as_posix()
+        except ValueError:
+            parent_rel = ""
+        keep = []
+        for name in sorted(dirnames):
+            path = current / name
+            if not include_hidden and name.startswith("."):
+                continue
+            try:
+                if path.is_symlink():
+                    continue
+            except OSError:
+                continue
+            keep.append(name)
+            arc = f"{base}/{name}" if parent_rel in ("", ".") else (
+                f"{base}/{parent_rel}/{name}"
+            )
+            entries.append((arc, path, True, 0))
+        dirnames[:] = keep
+
+        for name in sorted(filenames):
+            if not include_hidden and name.startswith("."):
+                continue
+            path = current / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                st = path.stat()
+            except OSError:
+                continue
+            total += st.st_size
+            arc = f"{base}/{name}" if parent_rel in ("", ".") else (
+                f"{base}/{parent_rel}/{name}"
+            )
+            entries.append((arc, path, False, st.st_size))
+            if len(entries) > ARCHIVE_MAX_ENTRIES:
+                raise ValueError(
+                    f"folder has too many entries (max {ARCHIVE_MAX_ENTRIES})"
+                )
+            if total > ARCHIVE_MAX_BYTES:
+                raise ValueError(
+                    f"folder is too large to archive "
+                    f"(max {ARCHIVE_MAX_BYTES} bytes)"
+                )
+
+        if len(entries) > ARCHIVE_MAX_ENTRIES:
+            raise ValueError(
+                f"folder has too many entries (max {ARCHIVE_MAX_ENTRIES})"
+            )
+        if total > ARCHIVE_MAX_BYTES:
+            raise ValueError(
+                f"folder is too large to archive (max {ARCHIVE_MAX_BYTES} bytes)"
+            )
+    if len(entries) > ARCHIVE_MAX_ENTRIES:
+        raise ValueError(f"folder has too many entries (max {ARCHIVE_MAX_ENTRIES})")
+    if total > ARCHIVE_MAX_BYTES:
+        raise ValueError(
+            f"folder is too large to archive (max {ARCHIVE_MAX_BYTES} bytes)"
+        )
+    return entries, total
+
+
+def _archive_headers(name: str, ext: str) -> dict:
+    filename = f"{name}.{ext}"
+    ascii_name = (
+        filename.encode("ascii", "replace")
+        .decode("ascii")
+        .replace('"', "_")
+        .replace("\r", "_")
+        .replace("\n", "_")
+    )
+    encoded = urllib.parse.quote(filename, safe="")
+    return {
+        "content-disposition": (
+            f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{encoded}"
+        ),
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+    }
+
+
+def _write_tar_manifest(entries: list[tuple[str, Path, bool, int]]) -> Path:
+    cfg.TMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="archive-", suffix=".list.part", dir=cfg.TMP_DIR)
+    with os.fdopen(fd, "wb") as fh:
+        for arcname, _path, _is_dir, _size in entries:
+            fh.write(os.fsencode(arcname))
+            fh.write(b"\0")
+    return Path(name)
+
+
+async def _tar_stream(
+    target: Path, entries: list[tuple[str, Path, bool, int]], manifest: Path
+):
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tar",
+            "-czf", "-",
+            "--directory", str(target.parent),
+            "--null",
+            "--no-recursion",
+            "--ignore-failed-read",
+            "--files-from", str(manifest),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        while True:
+            chunk = await proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            yield chunk
+        rc = await proc.wait()
+        if rc != 0:
+            print(f"[files] tar exited {rc} for {target}", flush=True)
+    finally:
+        try:
+            manifest.unlink()
+        except OSError:
+            pass
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        _archive_sem.release()
+
+
+def _build_zip(
+    entries: list[tuple[str, Path, bool, int]], tmp_path: Path
+) -> None:
+    with zipfile.ZipFile(
+        tmp_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
+    ) as zf:
+        for arcname, path, is_dir, _size in entries:
+            if is_dir:
+                zf.writestr(arcname.rstrip("/") + "/", b"")
+            else:
+                zf.write(path, arcname)
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+async def _serve_archive(
+    request: Request, target: Path, rel: str, kind: str
+) -> Response:
+    if not rel.strip("/"):
+        return _error(request, 403, "refusing to archive the root directory")
+    if not target.is_dir():
+        return _error(request, 404, "Not Found")
+
+    # Never expose dotfiles in downloads, even via ?hidden=1. Direct dotfile
+    # requests are refused by the static handler, so archives must match.
+    try:
+        entries, total = await asyncio.to_thread(
+            _collect_archive, target, False
+        )
+    except ValueError as exc:
+        return _error(request, 413, str(exc))
+
+    name = target.name
+    if kind == "zip":
+        if request.method == "HEAD":
+            return Response(
+                media_type="application/zip",
+                headers=_archive_headers(name, "zip"),
+            )
+        try:
+            await asyncio.wait_for(_archive_sem.acquire(), timeout=0.05)
+        except asyncio.TimeoutError:
+            return _error(request, 429, "too many concurrent archive builds")
+        tmp_path: Optional[Path] = None
+        try:
+            archive_dir = cfg.TMP_DIR / "archives"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                free = os.statvfs(archive_dir).f_bavail * os.statvfs(archive_dir).f_frsize
+            except OSError:
+                free = 0
+            if free and total > free * 0.8:
+                return _error(request, 507, "not enough temporary space for zip")
+            fd, raw = tempfile.mkstemp(
+                prefix="download-", suffix=".zip.part", dir=archive_dir
+            )
+            os.close(fd)
+            tmp_path = Path(raw)
+            await asyncio.to_thread(_build_zip, entries, tmp_path)
+        except Exception as exc:
+            print(f"[files] zip build failed for {target}: {exc}", flush=True)
+            if tmp_path is not None:
+                _unlink(tmp_path)
+            return _error(request, 500, "could not build zip archive")
+        finally:
+            _archive_sem.release()
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            headers=_archive_headers(name, "zip"),
+            background=BackgroundTask(_unlink, tmp_path),
+        )
+
+    # tar.gz streams straight from a `tar` subprocess.
+    if request.method == "HEAD":
+        return Response(
+            media_type="application/gzip",
+            headers=_archive_headers(name, "tar.gz"),
+        )
+    try:
+        await asyncio.wait_for(_archive_sem.acquire(), timeout=0.05)
+    except asyncio.TimeoutError:
+        return _error(request, 429, "too many concurrent archive builds")
+    try:
+        manifest = await asyncio.to_thread(_write_tar_manifest, entries)
+    except Exception as exc:
+        _archive_sem.release()
+        print(f"[files] tar manifest failed for {target}: {exc}", flush=True)
+        return _error(request, 500, "could not prepare tar archive")
+
+    return StreamingResponse(
+        _tar_stream(target, entries, manifest),
+        media_type="application/gzip",
+        headers=_archive_headers(name, "tar.gz"),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -225,12 +581,18 @@ def _listing(request: Request, target: Path, rel: str) -> Response:
         table = '<div class="empty">Empty directory.</div>'
 
     albums_href = f"{PREFIX}/albums" if PREFIX else "/albums"
+    publish_href = f"{PREFIX}/publish" if PREFIX else "/publish"
     body = (
         f"<h1>{html.escape(title)}</h1>"
         f'<a class="albums" href="{html.escape(albums_href)}">'
-        "Public albums — create one or upload any file type →</a>"
+        "Public albums — create one or upload any file type →</a> "
+        f'<a class="albums" href="{html.escape(publish_href)}">'
+        "Publish a folder (tar.gz/zip) →</a>"
         f'<p class="sub">Drop files here to publish them at '
-        f'<code>{html.escape(public_url(rel.strip("/"), True))}</code>.</p>'
+        f'<code>{html.escape(public_url(rel.strip("/"), True))}</code>. '
+        "Machine-readable listing: add <code>?format=json</code>; "
+        "whole-folder download: add <code>?archive=tar.gz</code> or "
+        "<code>?archive=zip</code>.</p>"
         f"{table}"
     )
     return _resp(request, _PAGE.format(title=html.escape(title), body=body),
@@ -245,6 +607,15 @@ async def handle(request: Request) -> Response:
     # ASGI `path` (and therefore the route param) is already percent-decoded by
     # the server — don't decode again or filenames containing a literal '%' break.
     rel = (request.path_params.get("path", "") or "").lstrip("/")
+
+    # `/<dir>/.index.json` is an alias for `?format=json`; strip the marker
+    # before path validation (it is a dotfile component the resolver refuses).
+    index_json = rel == ".index.json" or rel.endswith("/.index.json")
+    if rel == ".index.json":
+        rel = ""
+    elif index_json:
+        rel = rel[: -len("/.index.json")]
+
     # An empty path is the root directory, which is always a directory request.
     dir_requested = rel == "" or rel.endswith("/")
 
@@ -270,14 +641,38 @@ async def handle(request: Request) -> Response:
     if target is None:
         return _error(request, 403, "Forbidden")
 
+    fmt = (request.query_params.get("format") or "").strip().lower()
+    if fmt == "json" or index_json:
+        return _listing_json(
+            request,
+            target,
+            rel,
+            include_hidden=_truthy(request.query_params.get("hidden")),
+        )
+
+    archive = (request.query_params.get("archive") or "").strip().lower()
+    if archive:
+        if archive in ("tgz", "tar.gz", "targz"):
+            kind = "tar.gz"
+        elif archive == "zip":
+            kind = "zip"
+        else:
+            return _error(request, 400, "unsupported archive (use tar.gz or zip)")
+        if target.is_file():
+            return _error(request, 400, "cannot archive a file")
+        return await _serve_archive(request, target, rel, kind)
+
     if target.is_file():
         if dir_requested:
             return RedirectResponse(public_url(rel.strip("/")), status_code=307)
         headers = {
             "x-content-type-options": "nosniff",
         }
-        if FILE_MAX_AGE > 0:
-            headers["cache-control"] = f"public, max-age={FILE_MAX_AGE}"
+        # Never let a shared proxy/CDN (Vercel) cache file bodies. Vercel keys
+        # its edge cache on the URL and ignores the Range header, so a cached
+        # 206 partial poisons later full downloads and seeks (truncated files,
+        # unplayable video). no-store keeps every request Range-correct.
+        headers["cache-control"] = "no-store"
         media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         return FileResponse(
             target,
@@ -296,7 +691,7 @@ async def handle(request: Request) -> Response:
 
 
 app = Starlette(
-    routes=albums_routes() + [
+    routes=albums_routes() + publish_mod.routes() + [
         Route("/", handle),
         Route("/{path:path}", handle),
     ],

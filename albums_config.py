@@ -66,6 +66,9 @@ CACHE_DIR = Path(
 TMP_DIR = Path(
     os.environ.get("ALBUMS_TMP_DIR", str(DATA_DIR / "tmp"))
 ).expanduser()
+CHUNK_DIR = Path(
+    os.environ.get("ALBUMS_CHUNK_DIR", str(DATA_DIR / "chunks"))
+).expanduser()
 THUMB_DIR = Path(
     os.environ.get("ALBUMS_THUMB_DIR", str(DATA_DIR / "thumbs"))
 ).expanduser()
@@ -96,6 +99,9 @@ MAX_FILES = _int("ALBUMS_MAX_FILES", 50, 1)
 # Per-request body cap. Keeps Starlette's multipart spool bounded; also the
 # amount reserved against the global window when Content-Length is absent.
 MAX_REQUEST_BYTES = _int("ALBUMS_MAX_REQUEST_BYTES", 2 * 1024**3, 1)
+CHUNK_BYTES = _int("ALBUMS_CHUNK_BYTES", 4 * 1024**2, 256 * 1024)
+MAX_CHUNK_BYTES = _int("ALBUMS_MAX_CHUNK_BYTES", 8 * 1024**2, CHUNK_BYTES)
+CHUNK_TTL_SECONDS = _int("ALBUMS_CHUNK_TTL_SECONDS", 24 * 3600, 3600)
 # Refuse uploads when the canonical HDD is nearly full (abuse brake + ops guard).
 MIN_FREE_BYTES = _int("ALBUMS_MIN_FREE_BYTES", 5 * 1024**3, 0)
 CREATE_MAX_BODY = _int("ALBUMS_CREATE_MAX_BODY_BYTES", 64 * 1024, 1024)
@@ -135,7 +141,7 @@ EMAIL_API_URL = os.environ.get(
 
 def init_dirs() -> None:
     """Create local dirs. The HDD dir may legitimately fail (unmounted disk)."""
-    for path in (DATA_DIR, TMP_DIR, THUMB_DIR, PREVIEW_DIR, CACHE_DIR):
+    for path in (DATA_DIR, TMP_DIR, CHUNK_DIR, THUMB_DIR, PREVIEW_DIR, CACHE_DIR):
         path.mkdir(parents=True, exist_ok=True)
     try:
         HDD_DIR.mkdir(parents=True, exist_ok=True)

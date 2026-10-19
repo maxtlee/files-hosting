@@ -424,6 +424,138 @@ _DEVICE_JS = r"""
 })();
 """
 
+_UPLOAD_JS = r"""
+(function () {
+  "use strict";
+  var BASE = document.body.dataset.base || "/albums";
+
+  function message(v) {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    if (Array.isArray(v)) {
+      return v.map(message).filter(Boolean).join("; ");
+    }
+    if (typeof v === "object") {
+      var keys = ["message", "error", "detail", "reason", "description"];
+      for (var i = 0; i < keys.length; i++) {
+        if (v[keys[i]] !== undefined) {
+          var m = message(v[keys[i]]);
+          if (m) return m;
+        }
+      }
+      try { return JSON.stringify(v); } catch (e) { return ""; }
+    }
+    return String(v);
+  }
+  function errorFrom(status, text, statusText) {
+    var data = null;
+    try { data = JSON.parse(text); } catch (e) {}
+    if (data) {
+      var m = message(data.error) || message(data.detail) ||
+              message(data.message) || message(data.errors);
+      if (m) return m.length > 500 ? m.slice(0, 500) + "…" : m;
+    }
+    if (status === 0) {
+      return "Connection lost during upload. Check your network and tap Upload again.";
+    }
+    if (status === 413) return "This file is too large for the upload limit.";
+    if (status === 429) return "Upload rate limit reached. Try again shortly.";
+    if (text && text.length < 300 && text.indexOf("<") !== 0) return text;
+    return "Upload failed (HTTP " + status + (statusText ? " " + statusText : "") + ").";
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function putChunk(uploadId, index, blob, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", BASE + "/api/chunks/" + encodeURIComponent(uploadId) + "/" + index);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.setRequestHeader("Accept", "application/json");
+      xhr.timeout = 180000;
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable && onProgress) onProgress(e.loaded);
+      };
+      xhr.onload = function () {
+        var data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (e) {}
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(data || {});
+        } else {
+          var err = new Error(errorFrom(xhr.status, xhr.responseText, xhr.statusText));
+          err.status = xhr.status;
+          reject(err);
+        }
+      };
+      xhr.onerror = function () {
+        var err = new Error(errorFrom(0, "", ""));
+        err.status = 0;
+        reject(err);
+      };
+      xhr.ontimeout = xhr.onerror;
+      xhr.send(blob);
+    });
+  }
+  async function uploadOne(file, albumId, onProgress) {
+    var init = await fetch(BASE + "/api/albums/" + encodeURIComponent(albumId) + "/chunk/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ name: file.name, size: file.size, mime: file.type || "application/octet-stream" })
+    });
+    var initData = null;
+    try { initData = await init.json(); } catch (e) {}
+    if (!init.ok) throw new Error(errorFrom(init.status, JSON.stringify(initData || {}), init.statusText));
+    var uploadId = initData.upload_id;
+    var chunkBytes = initData.chunk_bytes || 4194304;
+    var sent = 0, index = 0;
+    while (sent < file.size) {
+      var end = Math.min(sent + chunkBytes, file.size);
+      var blob = file.slice(sent, end);
+      var attempt = 0;
+      for (;;) {
+        try {
+          await putChunk(uploadId, index, blob, function (loaded) {
+            if (onProgress) onProgress(sent + loaded, file.size);
+          });
+          break;
+        } catch (err) {
+          attempt++;
+          var retryable = !err.status || err.status >= 500 || err.status === 0;
+          if (!retryable || attempt >= 4) throw err;
+          await sleep(attempt * 1000);
+        }
+      }
+      sent = end;
+      index++;
+      if (onProgress) onProgress(sent, file.size);
+    }
+    var done = await fetch(BASE + "/api/chunks/" + encodeURIComponent(uploadId) + "/complete", {
+      method: "POST",
+      headers: { "Accept": "application/json" }
+    });
+    var doneData = null;
+    try { doneData = await done.json(); } catch (e) {}
+    if (!done.ok) throw new Error(errorFrom(done.status, JSON.stringify(doneData || {}), done.statusText));
+    return doneData.asset;
+  }
+  async function uploadFiles(files, albumId, opts) {
+    opts = opts || {};
+    var total = 0, done = 0, assets = [];
+    for (var i = 0; i < files.length; i++) total += files[i].size;
+    for (var j = 0; j < files.length; j++) {
+      if (opts.onFile) opts.onFile(j + 1, files.length, files[j].name);
+      var asset = await uploadOne(files[j], albumId, function (loaded) {
+        if (opts.onProgress) opts.onProgress(done + loaded, total);
+      });
+      done += files[j].size;
+      if (opts.onProgress) opts.onProgress(done, total);
+      assets.push(asset);
+    }
+    return assets;
+  }
+  window.AlbumsUpload = { uploadFiles: uploadFiles, errorFrom: errorFrom, message: message };
+})();
+"""
+
 _LAYOUT_JS = r"""
 (function () {
   "use strict";
@@ -509,33 +641,25 @@ _LAYOUT_JS = r"""
     var album = upSelect ? upSelect.value : "";
     if (!album) { setUploadStatus("Create an album first.", "err"); return; }
     if (!pending || !pending.length) { setUploadStatus("Choose files first.", "err"); return; }
-    var fd = new FormData();
-    for (var i = 0; i < pending.length; i++) fd.append("files", pending[i], pending[i].name);
-    var xhr = new XMLHttpRequest();
-    xhr.open("POST", BASE + "/api/albums/" + encodeURIComponent(album) + "/upload");
-    xhr.setRequestHeader("Accept", "application/json");
+    var files = Array.prototype.slice.call(pending);
     upGo.disabled = true;
     if (upBar) { upBar.style.display = "block"; upFill.style.width = "0%"; }
-    setUploadStatus("Uploading " + pending.length + " file(s)…");
-    xhr.upload.onprogress = function (e) {
-      if (e.lengthComputable && upFill) upFill.style.width = Math.round(e.loaded / e.total * 100) + "%";
-    };
-    xhr.onload = function () {
-      upGo.disabled = false;
-      var data = null;
-      try { data = JSON.parse(xhr.responseText); } catch (e) {}
-      if (xhr.status >= 200 && xhr.status < 300) {
-        setUploadStatus("Uploaded. Opening album…", "ok");
-        location.href = BASE + "/" + encodeURIComponent(album);
-      } else if (xhr.status === 429) {
-        setUploadStatus("Rate limit. Try again in " + (xhr.getResponseHeader("Retry-After") || "60") + "s.", "err");
-      } else {
-        var errs = data && data.errors ? data.errors.join("; ") : "";
-        setUploadStatus((data && data.error ? data.error : "Upload failed") + (errs ? ": " + errs : ""), "err");
+    setUploadStatus("Preparing upload…");
+    AlbumsUpload.uploadFiles(files, album, {
+      onFile: function (i, n, name) {
+        setUploadStatus("Uploading file " + i + " of " + n + " — " + name + "…");
+      },
+      onProgress: function (done, total) {
+        if (upFill && total) upFill.style.width = Math.min(100, Math.round(done / total * 100)) + "%";
       }
-    };
-    xhr.onerror = function () { upGo.disabled = false; setUploadStatus("Network error.", "err"); };
-    xhr.send(fd);
+    }).then(function () {
+      setUploadStatus("Uploaded. Opening album…", "ok");
+      location.href = BASE + "/" + encodeURIComponent(album);
+    }).catch(function (err) {
+      upGo.disabled = false;
+      if (upBar) upBar.style.display = "none";
+      setUploadStatus(err && err.message ? err.message : "Upload failed.", "err");
+    });
   });
   if (upDialog) upDialog.addEventListener("close", function () {
     pending = null;
@@ -932,31 +1056,22 @@ _ALBUM_UPLOAD_JS = r"""
     }
     if (!list.length) return;
     if (MAX_REQUEST && total > MAX_REQUEST) { say("Selection is " + mb(total) + "; max " + mb(MAX_REQUEST), "err"); return; }
-    var fd = new FormData();
-    for (var j = 0; j < list.length; j++) fd.append("files", list[j], list[j].name);
-    var xhr = new XMLHttpRequest();
-    xhr.open("POST", BASE + "/api/albums/" + encodeURIComponent(ALBUM) + "/upload");
-    xhr.setRequestHeader("Accept", "application/json");
+    if (!window.AlbumsUpload) { say("Upload helper unavailable. Reload the page.", "err"); return; }
     if (bar) { bar.style.display = "block"; fill.style.width = "0%"; }
-    say("Uploading " + list.length + " file(s)…");
-    xhr.upload.onprogress = function (e) {
-      if (e.lengthComputable && fill) fill.style.width = Math.round(e.loaded / e.total * 100) + "%";
-    };
-    xhr.onload = function () {
-      if (bar) bar.style.display = "none";
-      var data = null; try { data = JSON.parse(xhr.responseText); } catch (e) {}
-      if (xhr.status >= 200 && xhr.status < 300) {
-        say("Uploaded. Loading…", "ok");
-        setTimeout(function () { location.reload(); }, 300);
-      } else if (xhr.status === 429) {
-        say("Rate limit. Try again in " + (xhr.getResponseHeader("Retry-After") || "60") + "s.", "err");
-      } else {
-        var errs = data && data.errors ? data.errors.join("; ") : "";
-        say((data && data.error ? data.error : "Upload failed") + (errs ? ": " + errs : ""), "err");
+    say("Preparing upload…");
+    AlbumsUpload.uploadFiles(list, ALBUM, {
+      onFile: function (i, n, name) { say("Uploading file " + i + " of " + n + " — " + name + "…"); },
+      onProgress: function (done, totalBytes) {
+        if (fill && totalBytes) fill.style.width = Math.min(100, Math.round(done / totalBytes * 100)) + "%";
       }
-    };
-    xhr.onerror = function () { if (bar) bar.style.display = "none"; say("Network error.", "err"); };
-    xhr.send(fd);
+    }).then(function () {
+      if (bar) bar.style.display = "none";
+      say("Uploaded. Loading…", "ok");
+      setTimeout(function () { location.reload(); }, 300);
+    }).catch(function (err) {
+      if (bar) bar.style.display = "none";
+      say(err && err.message ? err.message : "Upload failed.", "err");
+    });
   }
   document.querySelectorAll("[data-upload-trigger]").forEach(function (el) {
     el.addEventListener("click", function () { if (fileInput) fileInput.click(); });
@@ -1253,7 +1368,11 @@ def _shell(
         f'data-view="{html.escape(view)}"{album_attr} '
         f'data-default-album="{html.escape(default_album)}"{limits}'
     )
-    scripts = "<script>" + _DEVICE_JS + "</script>" + "<script>" + _LAYOUT_JS + "</script>"
+    scripts = (
+        "<script>" + _DEVICE_JS + "</script>"
+        + "<script>" + _UPLOAD_JS + "</script>"
+        + "<script>" + _LAYOUT_JS + "</script>"
+    )
     if with_grid:
         scripts += "<script>" + _GRID_JS + "</script>"
     if album_mode:

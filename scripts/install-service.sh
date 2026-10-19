@@ -41,6 +41,7 @@ Environment=ALBUMS_DB_PATH=${REPO}/data/albums.sqlite3
 Environment=ALBUMS_THUMB_DIR=${REPO}/data/thumbs
 Environment=ALBUMS_PREVIEW_DIR=${REPO}/data/previews
 Environment=ALBUMS_TMP_DIR=${REPO}/data/tmp
+Environment=ALBUMS_CHUNK_DIR=${REPO}/data/chunks
 Environment=ALBUMS_CACHE_BUDGET_BYTES=6442450944
 Environment=ALBUMS_THUMB_BUDGET_BYTES=536870912
 Environment=ALBUMS_PREVIEW_BUDGET_BYTES=2147483648
@@ -50,12 +51,26 @@ Environment=ALBUMS_MIN_FREE_BYTES=5368709120
 Environment=ALBUMS_MAX_FILE_BYTES=1073741824
 Environment=ALBUMS_MAX_FILES=50
 Environment=ALBUMS_MAX_REQUEST_BYTES=2147483648
+Environment=ALBUMS_CHUNK_BYTES=4194304
+Environment=ALBUMS_MAX_CHUNK_BYTES=8388608
+Environment=ALBUMS_CHUNK_TTL_SECONDS=86400
 Environment=ALBUMS_RATE_WINDOW_SECONDS=300
 Environment=ALBUMS_RATE_LIMIT_BYTES=10737418240
 Environment=ALBUMS_PER_IP_RATE_BYTES=2147483648
 Environment=ALBUMS_NOTIFY_ENABLED=0
 Environment=ALBUMS_NOTIFY_TO=maxwe@cmu.edu
 Environment=ALBUMS_PUBLIC_BASE_URL=https://agentmaxxer.tail6ca935.ts.net/files
+# --- folder publishing (/publish) ------------------------------------------
+# FILES_PUBLISH_TOKEN is a secret and belongs in the repo .env file.
+Environment=FILES_PUBLISH_TMP_DIR=${REPO}/data/tmp/publish
+Environment=FILES_PUBLISH_MAX_REQUEST_BYTES=2147483648
+Environment=FILES_PUBLISH_MAX_ENTRIES=50000
+Environment=FILES_PUBLISH_MAX_FILES=5000
+Environment=FILES_PUBLISH_MAX_TOTAL_BYTES=21474836480
+Environment=FILES_PUBLISH_MIN_FREE_BYTES=2147483648
+Environment=FILES_ARCHIVE_MAX_ENTRIES=100000
+Environment=FILES_ARCHIVE_MAX_BYTES=21474836480
+Environment=FILES_ARCHIVE_MAX_CONCURRENT=2
 
 [Install]
 WantedBy=multi-user.target
