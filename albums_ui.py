@@ -465,6 +465,21 @@ _UPLOAD_JS = r"""
     return "Upload failed (HTTP " + status + (statusText ? " " + statusText : "") + ").";
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  async function requestWithRetry(url, opts) {
+    var lastErr = null;
+    for (var i = 0; i < 3; i++) {
+      try {
+        var res = await fetch(url, opts);
+        if (res.status >= 500 && i < 2) { await sleep(1000 * (i + 1)); continue; }
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (i >= 2) throw err;
+        await sleep(1000 * (i + 1));
+      }
+    }
+    throw lastErr || new Error("network error");
+  }
   function putChunk(uploadId, index, blob, onProgress) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
@@ -496,7 +511,7 @@ _UPLOAD_JS = r"""
     });
   }
   async function uploadOne(file, albumId, onProgress) {
-    var init = await fetch(BASE + "/api/albums/" + encodeURIComponent(albumId) + "/chunk/init", {
+    var init = await requestWithRetry(BASE + "/api/albums/" + encodeURIComponent(albumId) + "/chunk/init", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ name: file.name, size: file.size, mime: file.type || "application/octet-stream" })
@@ -528,7 +543,7 @@ _UPLOAD_JS = r"""
       index++;
       if (onProgress) onProgress(sent, file.size);
     }
-    var done = await fetch(BASE + "/api/chunks/" + encodeURIComponent(uploadId) + "/complete", {
+    var done = await requestWithRetry(BASE + "/api/chunks/" + encodeURIComponent(uploadId) + "/complete", {
       method: "POST",
       headers: { "Accept": "application/json" }
     });
