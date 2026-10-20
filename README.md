@@ -172,7 +172,11 @@ The GUI follows the Google Photos layout: a persistent left navigation rail on
 desktop (`Photos`, `Albums`, `New album`, `Upload`), a top search app bar, a
 date-grouped photo/video feed, album cards, Material-style dialogs, a
 full-screen lightbox with prev/next, and a mobile bottom bar (`Photos`,
-`Albums`, `Upload`, `New`). On phones the rail becomes a slide-out drawer; a
+`Albums`, `Upload`, `New`).
+The lightbox sizes media against the real visual viewport (`dvh` plus
+`visualViewport` updates), so portrait photos are never clipped by the iPhone
+toolbar; it also locks background scrolling, and documents/text scroll inside
+the stage. On phones the rail becomes a slide-out drawer; a
 **New album** dialog is reachable from every page, and uploads can target any
 album from the global **Upload** dialog. Album pages add an **Add photos**
 button, camera capture, and drag-and-drop over the grid. Long-press a tile on

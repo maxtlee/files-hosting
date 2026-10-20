@@ -299,9 +299,13 @@ textarea { resize: vertical; min-height: 72px; }
 .upload-area p { margin: 0 0 10px; color: var(--muted); }
 .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
 dialog.lightbox {
-  width: 100vw; height: 100vh; max-width: none; max-height: none; margin: 0;
+  width: 100vw; height: 100vh; height: 100dvh;
+  height: var(--app-vh, 100dvh);
+  max-width: none; max-height: 100vh; max-height: 100dvh;
+  max-height: var(--app-vh, 100dvh); margin: 0;
   border-radius: 0; background: #000; color: #fff; overflow: hidden;
 }
+body.lightbox-open { overflow: hidden; }
 dialog.lightbox::backdrop { background: #000; }
 .lb-top {
   position: absolute; inset: 0 0 auto 0; z-index: 4; display: flex;
@@ -314,22 +318,38 @@ dialog.lightbox::backdrop { background: #000; }
   color: #fff; display: grid; place-items: center; cursor: pointer; text-decoration: none;
 }
 .lb-icon:hover { background: rgba(255,255,255,.14); }
+dialog.lightbox:focus { outline: none; }
+dialog.lightbox button:focus, dialog.lightbox a:focus { outline: none; }
+dialog.lightbox button:focus-visible, dialog.lightbox a:focus-visible {
+  outline: 2px solid #8ab4f8; outline-offset: 2px;
+}
 .lb-pill {
   border: 1px solid rgba(255,255,255,.3); background: rgba(255,255,255,.12);
   color: #fff; border-radius: 999px; height: 38px; padding: 0 16px; cursor: pointer;
   font-weight: 500; white-space: nowrap;
 }
-.lb-stage { height: 100%; display: grid; place-items: center; padding: 66px 72px 72px; }
+.lb-stage {
+  height: 100%; min-height: 0; display: grid; place-items: center;
+  padding: 66px 72px 72px; overflow: auto; overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
 .lb-stage img, .lb-stage video {
-  max-width: 100%; max-height: 100%; object-fit: contain; display: block;
+  max-width: calc(100vw - 144px);
+  max-height: calc(var(--app-vh, 100dvh) - 150px);
+  width: auto; height: auto; object-fit: contain; display: block;
 }
 .lb-stage audio { width: min(80vw, 560px); }
 .lb-doc { text-align: center; color: #ddd; max-width: 100%; max-height: 100%; }
-.lb-doc img { max-width: min(92vw, 1100px); max-height: 78vh; object-fit: contain; background: #fff; border-radius: 4px; }
+.lb-doc img {
+  max-width: min(calc(100vw - 144px), 1100px);
+  max-height: calc(var(--app-vh, 100dvh) - 190px);
+  object-fit: contain; background: #fff; border-radius: 4px;
+}
 .lb-doc p { color: #aaa; font-size: 12px; margin: 8px 0 0; }
 .lb-doc a { color: #8ab4f8; }
 .lb-text {
-  display: none; margin: 0; width: min(92vw, 1000px); max-height: 78vh; overflow: auto;
+  display: none; margin: 0; width: min(92vw, 1000px);
+  max-height: calc(var(--app-vh, 100dvh) - 150px); overflow: auto;
   padding: 18px 20px; background: #17181b; color: #e8eaed; border-radius: 8px;
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre-wrap; overflow-wrap: anywhere; text-align: left;
@@ -388,6 +408,15 @@ body.dragging .drop-overlay { display: grid; }
   .bottom-nav .active { color: var(--blue); }
   .selection-bar { bottom: calc(70px + env(safe-area-inset-bottom)); }
   .lb-stage { padding: 58px 8px 60px; }
+  .lb-stage img, .lb-stage video {
+    max-width: calc(100vw - 16px);
+    max-height: calc(var(--app-vh, 100dvh) - 130px);
+  }
+  .lb-doc img {
+    max-width: calc(100vw - 16px);
+    max-height: calc(var(--app-vh, 100dvh) - 150px);
+  }
+  .lb-text { max-height: calc(var(--app-vh, 100dvh) - 130px); }
   .lb-nav { width: 42px; height: 42px; }
   .lb-prev { left: 4px; }
   .lb-next { right: 4px; }
@@ -414,6 +443,16 @@ _DEVICE_JS = r"""
   if (!isIOS && !isAndroid && !/Mobi/i.test(ua)) {
     body.classList.remove("device-mobile");
     body.classList.add("device-desktop");
+  }
+  function syncViewportHeight() {
+    var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    document.documentElement.style.setProperty("--app-vh", h + "px");
+  }
+  syncViewportHeight();
+  window.addEventListener("resize", syncViewportHeight, { passive: true });
+  window.addEventListener("orientationchange", syncViewportHeight, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncViewportHeight, { passive: true });
   }
   if (location.hash === "#new") {
     setTimeout(function () {
@@ -1003,7 +1042,11 @@ _GRID_JS = r"""
     }
     if (lbName) lbName.textContent = (current + 1) + " / " + t.length + " — " + name;
     if (lbOpen) lbOpen.href = full;
-    if (lb && !lb.open) lb.showModal();
+    if (lb && !lb.open) {
+      lb.showModal();
+      body.classList.add("lightbox-open");
+      try { lb.focus({ preventScroll: true }); } catch (e) {}
+    }
   }
   document.querySelectorAll("[data-grid]").forEach(function (root) {
     root.addEventListener("click", function (e) {
@@ -1027,7 +1070,11 @@ _GRID_JS = r"""
       if (e.key === "ArrowLeft") { e.preventDefault(); show(current - 1); }
       if (e.key === "ArrowRight") { e.preventDefault(); show(current + 1); }
     });
-    lb.addEventListener("close", function () { stopMedia(); shareCache = {}; });
+    lb.addEventListener("close", function () {
+      stopMedia();
+      shareCache = {};
+      body.classList.remove("lightbox-open");
+    });
   }
   var lbClose = document.getElementById("lb-close");
   if (lbClose) lbClose.addEventListener("click", function () { lb.close(); });
@@ -1323,7 +1370,7 @@ def _dialogs(albums: list[dict], current_album_id: str = "") -> str:
 
 def _lightbox() -> str:
     return (
-        '<dialog id="lightbox" class="lightbox">'
+        '<dialog id="lightbox" class="lightbox" tabindex="-1">'
         '<div class="lb-top">'
         '<button class="lb-icon" type="button" id="lb-close" aria-label="Close">'
         + _icon("back") + "</button>"
